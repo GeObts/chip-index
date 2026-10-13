@@ -232,12 +232,20 @@ FOUNDRY_PROFILE=deep forge test --no-match-path "test/fork/*" --match-path "test
 
 **4. base-forge for the Base fork tests.** Stock forge cannot run them: a B20 stock is a Base
 precompile, whose code is the single byte `0xef` to stock forge. Base publishes its own Foundry
-build (`base/base-anvil`), installed alongside the stock one:
+build (`base/base-anvil`) with its own installer script. Saved under the name `base-foundryup` it
+installs ONLY the Base build, as `base-forge` / `base-anvil` / `base-cast`, and leaves the stock
+`forge` alone:
 ```
-foundryup --network base --install v1.1.0
+mkdir -p ~/.foundry/bin
+curl -fsSL https://raw.githubusercontent.com/base/base-anvil/HEAD/foundryup/foundryup \
+  -o ~/.foundry/bin/base-foundryup
+chmod +x ~/.foundry/bin/base-foundryup
+~/.foundry/bin/base-foundryup --install v1.1.0   # base-anvil v1.1.0, the release these tests used
+~/.foundry/bin/base-forge --version               # forge 1.6.0-v1.1.0
 ```
-This adds `~/.foundry/bin/base-forge` (forge with Base precompiles on; base-anvil v1.1.0) and leaves
-the stock `forge` alone. Check it with `~/.foundry/bin/base-forge --version`.
+Do NOT use stock `foundryup --network base`: the current stock foundryup has no `--network` option
+and silently installs plain Foundry 1.1.0 instead (checked 2026-10-13). `base-forge` is a
+wrapper that runs the Base build with `FOUNDRY_BASE=true`.
 
 **5. Fork tests** (34, against live Base mainnet state, ~2 minutes).
 ```
