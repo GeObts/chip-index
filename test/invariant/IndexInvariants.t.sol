@@ -23,13 +23,13 @@ contract Handler is Test {
         address a = actors[who % 3];
         shares = bound(shares, 1, 50e18);
         if (vault.totalSupply() + shares > vault.mintCap()) return;
+        // Mint is refused outright while any stock is paused (IndexVault._requireMintable).
+        for (uint256 i; i < 8; ++i) {
+            if (stocks[i].transfersPaused()) return;
+        }
         (, uint256[] memory need) = vault.previewMint(shares);
         vm.startPrank(a);
         for (uint256 i; i < 8; ++i) {
-            if (stocks[i].transfersPaused() && need[i] != 0) {
-                vm.stopPrank();
-                return;
-            }
             stocks[i].mint(a, need[i]);
             stocks[i].approve(address(vault), need[i]);
         }
