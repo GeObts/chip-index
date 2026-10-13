@@ -28,7 +28,7 @@ Addresses verified 2026-10-12 against api.coinbase.com/v1/tokenized-stocks (all 
 | Valuation | raw balance × feed price. Feeds are total-return, and the Coinbase `multiplier` equals onchain `multiplier()`. |
 | Mint cap | Global cap on index totalSupply (no per-wallet cap): 2,500 tokens = $25,000 at launch, Safe-raisable. |
 | Blocklist | Redeem and claim are refused for any Coinbase-blocklisted caller, receiver or credit holder (owner decision 2026-10-12). |
-| Launch | "Chip Index"/"CHIDX" (placeholders); seed $1,000 for 100 tokens; $CHIP buys at most $100 each. All in `LaunchConfig`, script/Deploy.s.sol. |
+| Launch | "Chip Index"/"CHIPX"; seed $1,000 for 100 tokens; $CHIP buys at most $100 each. All in `LaunchConfig`, script/Deploy.s.sol. |
 | Fees (launch / hard cap) | mint 1% / 2%, redeem 1% / 2%, management 3%/yr / 5%/yr (accrued continuously as newly minted index tokens). |
 | Fee destination | New IndexFeeSplitter. Fees are sold to USDC: 50% goes to Pot `0x3918a9B4…855B` and 50% buys $CHIP (Uniswap v4 pool, keeper-supplied min-out, size cap) and sends it to ChipBurner `0x7Bc1C03e…5C0`. |
 | Rebalancer | Keeper only. It may trade any time a stock drifts more than 3 points from its target, and also once per 30 days regardless of drift. Every trade has slippage caps. |

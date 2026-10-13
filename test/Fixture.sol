@@ -90,7 +90,7 @@ abstract contract Fixture is Test {
         }
 
         registry = new BasketRegistry(safe, address(sequencer), address(factory), address(usdc), cfg, ts);
-        vault = new IndexVault(safe, registry, address(policies), "Chip Index", "CHIDX", 100, 100, 300, 1_000_000e18);
+        vault = new IndexVault(safe, registry, address(policies), "Chip Index", "CHIPX", 100, 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(safe, vault, ISlipstreamRouter(address(swap)), address(usdc), keeper);
         router = new IndexRouter(
             safe,

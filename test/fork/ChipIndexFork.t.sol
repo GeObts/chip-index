@@ -33,7 +33,7 @@ interface IB20AssetLike {
  *         Feed timestamps are refreshed with vm.mockCall (the PRICE stays the real one), so the
  *         suite gives the same answer on a weekend. The stale-feed test removes that override.
  */
-contract ChipIndexForkTest is Test {
+abstract contract ChipIndexForkBase is Test {
     // ---- Base mainnet ------------------------------------------------------
     address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address constant WETH = 0x4200000000000000000000000000000000000006;
@@ -99,7 +99,7 @@ contract ChipIndexForkTest is Test {
             ts[i] = STOCK_TS;
         }
         registry = new BasketRegistry(SAFE, SEQUENCER_FEED, SLIP_FACTORY, USDC, cfg, ts);
-        vault = new IndexVault(SAFE, registry, POLICY_REGISTRY, "Chip Index", "CHIDX", 100, 100, 300, 1_000_000e18);
+        vault = new IndexVault(SAFE, registry, POLICY_REGISTRY, "Chip Index", "CHIPX", 100, 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(SAFE, vault, ISlipstreamRouter(SLIP_ROUTER), USDC, KEEPER);
         router = new IndexRouter(
             SAFE, vault, ISlipstreamRouter(SLIP_ROUTER), USDC, WETH, ETH_USD_FEED, WETH_USDC_TS, KEEPER
@@ -138,8 +138,52 @@ contract ChipIndexForkTest is Test {
     }
 
     /* ------------------------------------------------------------------ */
-    /*                                tests                                */
+    /*                               helpers                               */
     /* ------------------------------------------------------------------ */
+
+    /// @dev Real stock taken from its Aerodrome USDC pool (a real B20 transfer).
+    function _give(address token, address to, uint256 amount) internal {
+        address pool = ISlipstreamFactory(SLIP_FACTORY).getPool(token, USDC, STOCK_TS);
+        vm.prank(pool);
+        IERC20(token).transfer(to, amount);
+    }
+
+    function _setBlocked(address who, bool blocked) internal {
+        address[] memory a = new address[](1);
+        a[0] = who;
+        vm.prank(POLICY_ADMIN);
+        IPolicyRegistry(POLICY_REGISTRY).updateBlocklist(COINBASE_BLOCKLIST, blocked, a);
+        assertEq(IPolicyRegistry(POLICY_REGISTRY).isAuthorized(COINBASE_BLOCKLIST, who), !blocked);
+    }
+
+    /// @dev Grant a B20 role by writing the precompile's storage (layout from base-std, which
+    ///      Base keeps byte-identical to the Rust implementation), then prove it took.
+    function _grantRole(address token, bytes32 role, address who) internal {
+        vm.store(token, MockB20Storage.roleMembershipSlot(role, who), bytes32(uint256(1)));
+        assertTrue(IB20(token).hasRole(role, who), "role write did not take");
+    }
+
+    /// @dev Keep the real price, refresh only updatedAt (so weekends do not fail the suite).
+    function _freshenFeeds() internal {
+        vm.clearMockedCalls();
+        for (uint256 i; i < N; ++i) {
+            _freshen(feedAddrs[i]);
+        }
+        _freshen(ETH_USD_FEED);
+    }
+
+    function _freshen(address feed) internal {
+        (uint80 r, int256 a, uint256 s,, uint80 air) = IAggregatorV3(feed).latestRoundData();
+        vm.mockCall(
+            feed,
+            abi.encodeWithSelector(IAggregatorV3.latestRoundData.selector),
+            abi.encode(r, a, s, block.timestamp, air)
+        );
+    }
+}
+
+/// @notice The core fork scenarios.
+contract ChipIndexForkTest is ChipIndexForkBase {
 
     function test_fork_seedIsRealStock() public view {
         for (uint256 i; i < N; ++i) {
@@ -474,49 +518,5 @@ contract ChipIndexForkTest is Test {
 
     function test_fork_smallMint_eth5() public {
         _smallEthMint(0.5e18);
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*                               helpers                               */
-    /* ------------------------------------------------------------------ */
-
-    /// @dev Real stock taken from its Aerodrome USDC pool (a real B20 transfer).
-    function _give(address token, address to, uint256 amount) internal {
-        address pool = ISlipstreamFactory(SLIP_FACTORY).getPool(token, USDC, STOCK_TS);
-        vm.prank(pool);
-        IERC20(token).transfer(to, amount);
-    }
-
-    function _setBlocked(address who, bool blocked) internal {
-        address[] memory a = new address[](1);
-        a[0] = who;
-        vm.prank(POLICY_ADMIN);
-        IPolicyRegistry(POLICY_REGISTRY).updateBlocklist(COINBASE_BLOCKLIST, blocked, a);
-        assertEq(IPolicyRegistry(POLICY_REGISTRY).isAuthorized(COINBASE_BLOCKLIST, who), !blocked);
-    }
-
-    /// @dev Grant a B20 role by writing the precompile's storage (layout from base-std, which
-    ///      Base keeps byte-identical to the Rust implementation), then prove it took.
-    function _grantRole(address token, bytes32 role, address who) internal {
-        vm.store(token, MockB20Storage.roleMembershipSlot(role, who), bytes32(uint256(1)));
-        assertTrue(IB20(token).hasRole(role, who), "role write did not take");
-    }
-
-    /// @dev Keep the real price, refresh only updatedAt (so weekends do not fail the suite).
-    function _freshenFeeds() internal {
-        vm.clearMockedCalls();
-        for (uint256 i; i < N; ++i) {
-            _freshen(feedAddrs[i]);
-        }
-        _freshen(ETH_USD_FEED);
-    }
-
-    function _freshen(address feed) internal {
-        (uint80 r, int256 a, uint256 s,, uint80 air) = IAggregatorV3(feed).latestRoundData();
-        vm.mockCall(
-            feed,
-            abi.encodeWithSelector(IAggregatorV3.latestRoundData.selector),
-            abi.encode(r, a, s, block.timestamp, air)
-        );
     }
 }

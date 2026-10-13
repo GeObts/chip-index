@@ -140,6 +140,32 @@ contract IndexRouterTest is Fixture {
         assertEq(vault.owed(address(router), address(stocks[3])), 0);
     }
 
+    /* ---------------- wallets that cannot take ETH ------------------- */
+
+    /// A contract wallet whose receive() reverts still mints; its refund arrives as WETH.
+    function test_ethRefund_fallsBackToWethForRejectingWallet() public {
+        EthRejectingWallet w = new EthRejectingWallet();
+        vm.deal(address(w), 1 ether);
+        uint256 spent = w.mintWithEth(router, 0.5 ether, 10e18, deadline);
+        assertEq(vault.balanceOf(address(w)), 9.9e18);
+        assertEq(weth.balanceOf(address(w)), 0.5 ether - spent, "refund paid as WETH");
+        assertEq(address(w).balance, 0.5 ether, "no ETH came back");
+        _assertRouterEmpty();
+    }
+
+    /// Redeeming to ETH for a recipient that rejects ETH pays WETH instead of reverting.
+    function test_redeemToEth_fallsBackToWethForRejectingRecipient() public {
+        vm.prank(alice);
+        router.mintWithUsdc(10e18, 200e6, alice, deadline);
+        EthRejectingWallet w = new EthRejectingWallet();
+        uint256 shares = vault.balanceOf(alice);
+        vm.prank(alice);
+        uint256 out = router.redeemToEth(shares, 0, address(w), deadline);
+        assertGt(out, 0);
+        assertEq(weth.balanceOf(address(w)), out);
+        _assertRouterEmpty();
+    }
+
     /* --------------------------- blocklist --------------------------- */
 
     function test_blocklist_cashRedeemCallerRefused() public {
@@ -225,5 +251,19 @@ contract IndexRouterTest is Fixture {
         for (uint256 i; i < N; ++i) {
             assertEq(stocks[i].balanceOf(address(router)), 0, "router stock");
         }
+    }
+}
+
+/// @notice A contract wallet with no way to receive ETH (its receive reverts).
+contract EthRejectingWallet {
+    receive() external payable {
+        revert("no ETH");
+    }
+
+    function mintWithEth(IndexRouter router, uint256 value, uint256 shares, uint256 deadline)
+        external
+        returns (uint256)
+    {
+        return router.mintWithEth{value: value}(shares, address(this), deadline);
     }
 }

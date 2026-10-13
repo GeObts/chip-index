@@ -17,9 +17,9 @@ import {PoolKey} from "../src/interfaces/IUniswapV4.sol";
 /// @notice Every owner-chosen launch value lives in this one block. The deploy and the seed
 ///         scripts both read it, and `Deploy.verify` checks the deployed contracts against it.
 library LaunchConfig {
-    // PLACEHOLDERS, to be confirmed by the owner before deploy.
+    // Confirmed by the owner 2026-10-13.
     string internal constant NAME = "Chip Index";
-    string internal constant SYMBOL = "CHIDX";
+    string internal constant SYMBOL = "CHIPX";
 
     /// Total cap on index tokens in existence, for ALL holders together (no per-wallet limit).
     /// 2,500 tokens = $25,000 at the $10 launch price. The Safe can raise it later (setMintCap).

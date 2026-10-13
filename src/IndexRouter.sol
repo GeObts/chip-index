@@ -63,6 +63,7 @@ contract IndexRouter is Ownable2Step, ReentrancyGuard {
     event LegSlippageSet(uint16 bps);
     event EthFeedMaxAgeSet(uint256 maxAge);
     event WethUsdcTickSpacingSet(int24 tickSpacing);
+    event EthPaidAsWeth(address indexed to, uint256 amount);
 
     error ZeroAddress();
     error Expired(uint256 deadline);
@@ -74,7 +75,6 @@ contract IndexRouter is Ownable2Step, ReentrancyGuard {
     error NoSuchPool(int24 tickSpacing);
     error SpentAboveMax(uint256 spent, uint256 max);
     error OutputBelowMin(uint256 out, uint256 min);
-    error EthSendFailed();
     error OnlyWeth();
 
     constructor(
@@ -386,8 +386,15 @@ contract IndexRouter is Ownable2Step, ReentrancyGuard {
         if (msg.sender != owner() && msg.sender != keeper) revert NotOwnerOrKeeper();
     }
 
+    /// @dev Pay ETH, falling back to WETH if the recipient cannot take ETH (a contract wallet with no
+    ///      or a reverting `receive`). A refund or payout can therefore never block a mint or redeem.
+    ///      All gas is forwarded, so Safes and smart wallets that do work in `receive` still get ETH.
     function _sendEth(address to, uint256 amount) internal {
         (bool ok,) = to.call{value: amount}("");
-        if (!ok) revert EthSendFailed();
+        if (!ok) {
+            IWETH(address(weth)).deposit{value: amount}();
+            weth.safeTransfer(to, amount);
+            emit EthPaidAsWeth(to, amount);
+        }
     }
 }

@@ -47,7 +47,7 @@ against every listed stock's SENDER/RECEIVER/EXECUTOR policies through Base's Po
 (`isAuthorized`). It reverts `Blocklisted(account, token)` if any of them is blocked by any stock.
 Claiming a credit checks the claimant and the destination for that stock. The Router also checks the
 cash recipient. Nothing is burned when a redeem is refused.
-**Index-token transfers stay unrestricted, by owner decision (2026-10-12).** CHIDX is a plain,
+**Index-token transfers stay unrestricted, by owner decision (2026-10-12).** CHIPX is a plain,
 freely transferable ERC-20, with no blocklist check on `transfer`/`transferFrom`. A blocklisted holder
 can therefore move index tokens to a clean address that then redeems. This is accepted, to keep the
 index token a normal composable ERC-20.

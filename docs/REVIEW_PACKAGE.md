@@ -19,7 +19,7 @@ of the stocks. Fees go 50% to the Chipworks Pot as USDC and 50% to buy-and-burn 
 |---|---|---|---|
 | `IndexVault` | 528 | 18.2 KB | The index token. Pro-rata in-kind mint (rounds up) and redeem (rounds down) with **no oracle**; redeem has **no pause**. Undeliverable legs (issuer pause, vault blocklisted) become claimable credits. Refuses redeem/claim for issuer-blocklisted caller, receiver or credit holder. Mint cap (global), mint pause. Fees: mint/redeem (cap 2%), management (cap 5%/yr, per-second accrual as minted shares). Executes rebalance trades for the Rebalancer and itself enforces Chainlink value-in vs value-out (max 1%, cap 2%). Rebalancer and fee-recipient changes: 48h timelock. |
 | `BasketRegistry` | 319 | 10.4 KB | Tokens, feeds and target weights. Launch basket set in the constructor; any later change replaces the whole basket through a 48h timelock with a 14-day grace window. Dropped tokens still held stay listed at weight 0 until `prune`. Chainlink reads: positive answer, `maxFeedAge` (26h default, 1h–72h), Base sequencer uptime with 1h grace. |
-| `IndexRouter` | 393 | 14.8 KB | Cash mint (exact-output swaps USDC/ETH→each stock on Aerodrome Slipstream) and cash redeem (exact-input stock→USDC/ETH). User limit plus each leg within 1% of Chainlink. Mint and redeem both require all feeds fresh. Owner or keeper can pause either path; only the owner unpauses. Checks the cash recipient against the blocklist. Holds no balance between calls. |
+| `IndexRouter` | 393 | 14.8 KB | Cash mint (exact-output swaps USDC/ETH→each stock on Aerodrome Slipstream) and cash redeem (exact-input stock→USDC/ETH). User limit plus each leg within 1% of Chainlink. Mint and redeem both require all feeds fresh. Owner or keeper can pause either path; only the owner unpauses. Checks the cash recipient against the blocklist. ETH refunds/payouts forward all gas and fall back to WETH if the recipient rejects ETH, so a contract wallet can never block its own mint or redeem. Holds no balance between calls. |
 | `Rebalancer` | 173 | 6.1 KB | Keeper-only. Allowed when any weight drifts more than 3 points from target, or 30 days after the last rebalance. Each trade must sell an overweight and buy an underweight stock, and total absolute drift must fall. Routes stock→USDC→stock on Aerodrome via the vault's callback. |
 | `IndexFeeSplitter` | 349 | 11.6 KB | Fee recipient. `redeemFees` (anyone, fee-free) → `sellForUsdc` (keeper, Chainlink floor) → `distribute` (anyone: 50% to the Pot, 50% to `chipBudget`) → `buyAndBurn` (keeper: USDC→WETH on Aerodrome, WETH→$CHIP on the Uniswap v4 pool via unlock callback, then ChipBurner.burnAll). `maxChipBuyUsdc` = $100 per call. `sweep` cannot touch fee-flow tokens or listed stocks. |
 | `lib/OracleLib`, `lib/Timelock` | 118 | — | Feed and sequencer checks; generic queue/execute/cancel timelock keyed by `keccak256(action, data)`. |
@@ -51,7 +51,7 @@ These come from the B20 tokens themselves and cannot be removed by any contract.
 | **Denim** upgrade (scheduled, no date) applies the executor check to plain `transfer` | The vault and router are not allowlisted. If policy 5 ever became an allowlist, all stock movement would stop. | Documented (ASSUMPTIONS A-4) |
 | **Wrapper vs blocklist** | Owner decision: the vault refuses redeem and claim for any blocklisted caller, receiver or credit holder, and the router also checks the cash recipient. | 7 unit + 6 fork tests (§6) |
 
-**Index-token transfers are INTENTIONALLY unrestricted (owner decision, 2026-10-12).** CHIDX is a
+**Index-token transfers are INTENTIONALLY unrestricted (owner decision, 2026-10-12).** CHIPX is a
 plain, freely transferable OpenZeppelin ERC-20 with no blocklist, pause or hook on `transfer` or
 `transferFrom`. The blocklist is enforced only where stock leaves the vault (redeem and claim). So a
 Coinbase-blocklisted holder can transfer index tokens to a clean address, and that address can then
@@ -71,18 +71,18 @@ redeem/claim checks on their own terms, not as a complete compliance barrier.
 
 ## 6. Test results (2026-10-12)
 
-**Unit + invariant (mocks): 86 passed, 0 failed.** `forge test --no-match-path "test/fork/*"`
+**Unit + invariant (mocks): 88 passed, 0 failed.** `forge test --no-match-path "test/fork/*"`
 
 | Suite | Tests | Covers |
 |---|---|---|
 | IndexVault | 32 | seed, pro-rata mint/redeem, fees and caps, management accrual, credits, pause, vault-blocklisted stock, **blocklist (5)**, sync, timelocks, 2 fuzz tests (512 runs) |
-| IndexRouter | 17 | USDC/ETH mint and redeem, 1% leg bound, user limits, stale feeds, pause roles, credits go to the user, **blocklist (2)** |
+| IndexRouter | 19 | USDC/ETH mint and redeem, 1% leg bound, user limits, stale feeds, pause roles, credits go to the user, **blocklist (2)**, ETH-rejecting wallet gets WETH (2) |
 | BasketRegistry | 15 | launch basket, validation, timelock delay/grace/mismatch/cancel, add/remove/prune, stale/bad/broken feeds, sequencer |
 | Rebalancer | 11 | eligibility (drift / 30 days), over/underweight rules, overshoot, vault slippage, keeper minOut, removed ticker |
 | IndexFeeSplitter | 8 | fee-free redeem, 50/50 split, oracle floor, buy-and-burn, caps, sweep limits |
 | Invariants | 3 | §3 items 3 and 4, plus full redeem always succeeds: 64×100 calls by default, 512×500 in the `deep` profile (passed at 256,000 calls) |
 
-**Base mainnet fork (real B20s, feeds, Aerodrome, $CHIP v4 pool, ChipBurner): 24 passed, 0 failed.**
+**Base mainnet fork (real B20s, feeds, Aerodrome, $CHIP v4 pool, ChipBurner): 30 passed, 0 failed.**
 `./script/fork-test.sh` (base-forge)
 
 | Test | Result |
@@ -100,6 +100,7 @@ redeem/claim checks on their own terms, not as a complete compliance barrier.
 | Rebalance | drift 4.95 → 4.01 points; NAV 1,060.00 → 1,059.95 |
 | Fee pipeline (1 year) | 3% minted; $14.55 to Pot; ~20.2M $CHIP bought and burned; supply fell by exactly that |
 | Small cash mints (4) | see table below; unspent ETH refunded |
+| Contract wallets (6) | real Coinbase Smart Wallet v1.1 and Safe v1.4.1 created with the official Base factories: ETH and USDC mint + redeem, in-kind redeem; refunds arrive as ETH; an ETH-rejecting contract gets WETH (see below) |
 
 Small cash mints, with gas at 0.006 gwei (live 2026-10-12):
 
@@ -113,6 +114,12 @@ Small cash mints, with gas at 0.006 gwei (live 2026-10-12):
 **Measured on the fork:**
 - Nothing blocks small cash mints; a $0.01 USDC mint also worked in a one-off probe. Gas does not
   depend on size (8 swaps), so it weighs most on the smallest mints.
+- **Contract wallets.** On a  mint, both the Coinbase Smart Wallet and the Safe paid 0.008017 ETH
+  (or 20.03 USDC). The unspent ETH came back as ETH, with no WETH and no reverts. A redeem returned
+  0.007845 ETH (or 19.61 USDC). The Router held nothing afterwards. The Smart Wallet is driven by its
+  owner calling execute/executeBatch. Through a 4337 bundler the wallet makes the same call, so the
+  Router sees the same caller. The Safe is a 1-of-1 driven through execTransaction. If a contract
+  cannot accept ETH at all, the refund or payout is sent as WETH instead (EthPaidAsWeth event).
 - Fork wallets are checked to have no code. The default `makeAddr("alice")` address carries an
   EIP-7702 delegation on Base mainnet that forwards received ETH, which once made the router's
   correct ETH refund look missing.
@@ -136,6 +143,9 @@ weekends.
    behave correctly with the Doppler hook's dynamic fee?
 5. Management fee as per-second minted shares: rounding or accrual-ordering issues around `setFees`
    and `executeFeeRecipient`?
+6. `IndexRouter._sendEth` forwards all gas and falls back to WETH on failure. The recipient is always
+   the payer (refund) or a caller-chosen `to` (redeem). Is there any grief or reentrancy path? The
+   Router is `nonReentrant` and holds nothing between calls.
 
 ## 8. Files to read
 `docs/SPEC.md` (decisions) · `docs/ASSUMPTIONS.md` (trust model) · `docs/DEPLOY.md` (procedure) ·

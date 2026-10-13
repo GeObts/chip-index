@@ -7,7 +7,7 @@ Every launch value is in ONE place: the `LaunchConfig` block at the top of `scri
 
 | Setting | Value | Status |
 |---|---|---|
-| Name / ticker | "Chip Index" / "CHIDX" | placeholders, confirm before deploy |
+| Name / ticker | "Chip Index" / "CHIPX" | decided (2026-10-13) |
 | Mint cap | 2,500 index tokens (= $25,000 at $10), global, Safe-raisable | decided |
 | Max USDC per $CHIP buy | $100 (fork: 0.68% vs spot) | decided |
 | First mint | $125 × 8 stocks = $1,000 → 100 tokens ($10 each) | decided |
