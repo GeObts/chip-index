@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+import {Script, console2} from "forge-std/Script.sol";
+
+import {BasketRegistry} from "../src/BasketRegistry.sol";
+import {IndexFeeSplitter} from "../src/IndexFeeSplitter.sol";
+import {IndexRouter} from "../src/IndexRouter.sol";
+import {IndexVault} from "../src/IndexVault.sol";
+import {Rebalancer} from "../src/Rebalancer.sol";
+import {ISlipstreamRouter} from "../src/interfaces/ISlipstreamRouter.sol";
+import {PoolKey} from "../src/interfaces/IUniswapV4.sol";
+
+/// @notice Every Base mainnet address the deploy uses, in one place.
+///         Basket + feeds verified 2026-10-12 (Coinbase API, all pages, and onchain descriptions).
+library Addrs {
+    address internal constant SAFE = 0xe1096B727499a3f70FaD8bc0267F5e69d01373C7;
+    address internal constant KEEPER = 0x6571E3412553Fada40C3D96e61E7Cfd20A0695B9;
+    address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    address internal constant WETH = 0x4200000000000000000000000000000000000006;
+    address internal constant CHIP = 0x75Af968d2e58749FDA1b42C58186B76f5E511bA3;
+    address internal constant CHIP_BURNER = 0x7Bc1C03e843C37845d89B54667382b4577Ead5C0;
+    address internal constant POT = 0x3918a9B479Ce9B58238584c645079AB3bB49855B;
+    address internal constant SLIP_FACTORY = 0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef;
+    address internal constant SLIP_ROUTER = 0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F;
+    address internal constant SEQUENCER_FEED = 0xBCF85224fc0756B9Fa45aA7892530B47e10b6433;
+    address internal constant ETH_USD_FEED = 0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
+    address internal constant POOL_MANAGER = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
+    address internal constant CHIP_HOOK = 0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544;
+    uint24 internal constant CHIP_POOL_FEE = 0x800000; // dynamic-fee flag
+    int24 internal constant CHIP_POOL_TS = 200;
+    int24 internal constant STOCK_USDC_TS = 10; // every B20/USDC pool with real depth
+    int24 internal constant WETH_USDC_TS = 50; // deepest Aerodrome WETH/USDC pool
+
+    function basket() internal pure returns (BasketRegistry.AssetConfig[] memory c, int24[] memory ts) {
+        c = new BasketRegistry.AssetConfig[](8);
+        c[0] = BasketRegistry.AssetConfig(0xb20000000000000000000078ee7ce2fE4908108C, 0x04689a41629776563E6822F76f2e57D148d28513, 1_250); // NVDA
+        c[1] = BasketRegistry.AssetConfig(0xb2000000000000000000004884b426556b92883d, 0xB3cE282CD188b35DA0E38D8Bc7d58e33173D202a, 1_250); // MSTR
+        c[2] = BasketRegistry.AssetConfig(0xb2000000000000000000002D0BA3164cc74f58B7, 0x5bF49E0ffA937CE2FfF033c739aD7C634c4D34F2, 1_250); // GOOGL
+        c[3] = BasketRegistry.AssetConfig(0xb200000000000000000000d9192b6B456483C2E8, 0x06A8E4b3aBB3B7543d8396FB2B763d22820cB295, 1_250); // AMZN
+        c[4] = BasketRegistry.AssetConfig(0xb200000000000000000000C2e324d24d7eEcd1fb, 0x787f13dEa48Db0897CbCDD985de77809D837F988, 1_250); // AAPL
+        c[5] = BasketRegistry.AssetConfig(0xb2000000000000000000008bC8786B856E61707C, 0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D, 1_250); // META
+        c[6] = BasketRegistry.AssetConfig(0xb2000000000000000000001e800a7f5189430cD0, 0xFaf869185383a24F8cb00e27BdA6b63B9905DCb4, 1_250); // TSLA
+        c[7] = BasketRegistry.AssetConfig(0xB200000000000000000000Ab99cFa739E253872B, 0xeB10A6c9aa7E537aEd766C08c35Dae35B321b18c, 1_250); // MSFT
+        ts = new int24[](8);
+        for (uint256 i; i < 8; ++i) {
+            ts[i] = STOCK_USDC_TS;
+        }
+    }
+}
+
+/**
+ * @notice Deploys the five Chip Index contracts, owned by the Safe from the constructor, wires
+ *         them, and checks the result. The deploy wallet ends up owning NOTHING.
+ *
+ *         It does NOT seed the index: the first mint comes from the Safe (script/SafeSeed.s.sol).
+ *
+ *         Requires env: INDEX_NAME, INDEX_SYMBOL, MINT_CAP (whole index tokens),
+ *         MAX_CHIP_BUY_USDC (whole USDC). There are no defaults: the owner picks each one.
+ *
+ *         MUST be simulated with Base's forge (the registry reads B20 decimals):
+ *             base-forge script script/Deploy.s.sol --rpc-url $BASE_RPC_URL           (dry run)
+ *         Broadcasting to mainnet happens ONLY with the owner's explicit go-ahead.
+ */
+contract Deploy is Script {
+    struct Deployed {
+        BasketRegistry registry;
+        IndexVault vault;
+        Rebalancer rebalancer;
+        IndexRouter router;
+        IndexFeeSplitter splitter;
+    }
+
+    struct Params {
+        string name;
+        string symbol;
+        uint256 mintCap; // 18-dec index tokens
+        uint256 maxChipBuyUsdc; // 6-dec USDC
+    }
+
+    uint16 internal constant MINT_FEE_BPS = 100;
+    uint16 internal constant REDEEM_FEE_BPS = 100;
+    uint16 internal constant MGMT_FEE_BPS = 300;
+
+    function run() external returns (Deployed memory d) {
+        Params memory p = Params({
+            name: vm.envString("INDEX_NAME"),
+            symbol: vm.envString("INDEX_SYMBOL"),
+            mintCap: vm.envUint("MINT_CAP") * 1e18,
+            maxChipBuyUsdc: vm.envUint("MAX_CHIP_BUY_USDC") * 1e6
+        });
+        require(Addrs.SAFE.code.length > 0, "Safe has no code");
+
+        vm.startBroadcast();
+        d = deploy(p);
+        vm.stopBroadcast();
+
+        verify(d, p);
+        _log(d);
+    }
+
+    function deploy(Params memory p) public returns (Deployed memory d) {
+        (BasketRegistry.AssetConfig[] memory cfg, int24[] memory ts) = Addrs.basket();
+        d.registry = new BasketRegistry(Addrs.SAFE, Addrs.SEQUENCER_FEED, Addrs.SLIP_FACTORY, Addrs.USDC, cfg, ts);
+        d.vault = new IndexVault(
+            Addrs.SAFE, d.registry, p.name, p.symbol, MINT_FEE_BPS, REDEEM_FEE_BPS, MGMT_FEE_BPS, p.mintCap
+        );
+        d.rebalancer = new Rebalancer(Addrs.SAFE, d.vault, ISlipstreamRouter(Addrs.SLIP_ROUTER), Addrs.USDC, Addrs.KEEPER);
+        d.router = new IndexRouter(
+            Addrs.SAFE,
+            d.vault,
+            ISlipstreamRouter(Addrs.SLIP_ROUTER),
+            Addrs.USDC,
+            Addrs.WETH,
+            Addrs.ETH_USD_FEED,
+            Addrs.WETH_USDC_TS,
+            Addrs.KEEPER
+        );
+        d.splitter = new IndexFeeSplitter(
+            IndexFeeSplitter.Config({
+                owner: Addrs.SAFE,
+                vault: d.vault,
+                swapRouter: ISlipstreamRouter(Addrs.SLIP_ROUTER),
+                usdc: Addrs.USDC,
+                weth: Addrs.WETH,
+                chip: Addrs.CHIP,
+                burner: Addrs.CHIP_BURNER,
+                pot: Addrs.POT,
+                poolManager: Addrs.POOL_MANAGER,
+                ethUsdFeed: Addrs.ETH_USD_FEED,
+                chipPoolKey: PoolKey(Addrs.WETH, Addrs.CHIP, Addrs.CHIP_POOL_FEE, Addrs.CHIP_POOL_TS, Addrs.CHIP_HOOK),
+                wethUsdcTickSpacing: Addrs.WETH_USDC_TS,
+                keeper: Addrs.KEEPER,
+                maxChipBuyUsdc: p.maxChipBuyUsdc
+            })
+        );
+        d.registry.wireVault(address(d.vault));
+        d.vault.wire(address(d.splitter), address(d.rebalancer));
+    }
+
+    /// @notice Everything the deploy promises, checked onchain. Also used by the fork rehearsal.
+    function verify(Deployed memory d, Params memory p) public view {
+        require(d.registry.owner() == Addrs.SAFE, "registry owner");
+        require(d.vault.owner() == Addrs.SAFE, "vault owner");
+        require(d.rebalancer.owner() == Addrs.SAFE, "rebalancer owner");
+        require(d.router.owner() == Addrs.SAFE, "router owner");
+        require(d.splitter.owner() == Addrs.SAFE, "splitter owner");
+        require(d.registry.pendingOwner() == address(0) && d.vault.pendingOwner() == address(0), "pending owner");
+
+        require(d.registry.vault() == address(d.vault), "registry -> vault");
+        require(address(d.vault.registry()) == address(d.registry), "vault -> registry");
+        require(d.vault.feeRecipient() == address(d.splitter), "fee recipient");
+        require(d.vault.rebalancer() == address(d.rebalancer), "rebalancer");
+        require(address(d.router.vault()) == address(d.vault), "router -> vault");
+        require(address(d.rebalancer.vault()) == address(d.vault), "rebalancer -> vault");
+        require(address(d.splitter.vault()) == address(d.vault), "splitter -> vault");
+
+        require(d.rebalancer.keeper() == Addrs.KEEPER, "rebalancer keeper");
+        require(d.router.keeper() == Addrs.KEEPER, "router keeper");
+        require(d.splitter.keeper() == Addrs.KEEPER, "splitter keeper");
+
+        require(d.vault.mintFeeBps() == MINT_FEE_BPS, "mint fee");
+        require(d.vault.redeemFeeBps() == REDEEM_FEE_BPS, "redeem fee");
+        require(d.vault.mgmtFeeBps() == MGMT_FEE_BPS, "mgmt fee");
+        require(d.vault.mintCap() == p.mintCap, "mint cap");
+        require(d.vault.totalSupply() == 0, "unexpected supply");
+        require(keccak256(bytes(d.vault.symbol())) == keccak256(bytes(p.symbol)), "symbol");
+        require(d.splitter.pot() == Addrs.POT, "pot");
+        require(address(d.splitter.burner()) == Addrs.CHIP_BURNER, "burner");
+        require(d.splitter.maxChipBuyUsdc() == p.maxChipBuyUsdc, "chip buy cap");
+
+        (BasketRegistry.AssetConfig[] memory cfg,) = Addrs.basket();
+        require(d.registry.assetCount() == cfg.length, "basket size");
+        for (uint256 i; i < cfg.length; ++i) {
+            BasketRegistry.Asset memory a = d.registry.assetAt(i);
+            require(a.token == cfg[i].token && a.feed == cfg[i].feed && a.weightBps == 1_250, "basket entry");
+            require(a.tokenDecimals == 8 && a.feedDecimals == 8, "decimals");
+        }
+    }
+
+    function _log(Deployed memory d) internal pure {
+        console2.log("BasketRegistry  ", address(d.registry));
+        console2.log("IndexVault      ", address(d.vault));
+        console2.log("Rebalancer      ", address(d.rebalancer));
+        console2.log("IndexRouter     ", address(d.router));
+        console2.log("IndexFeeSplitter", address(d.splitter));
+    }
+}

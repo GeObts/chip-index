@@ -1,66 +1,21 @@
-## Foundry
+# Chip Index
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+An onchain stock index on Base: one ERC-20 backed by an equal-weight basket of Coinbase B20
+tokenized stocks (NVDA, MSTR, GOOGL, AMZN, AAPL, META, TSLA, MSFT). Part of the Chipworks stack.
 
-Foundry consists of:
+| Contract | Role |
+|---|---|
+| `BasketRegistry` | Stocks, feeds and target weights; changes go through a 48h timelock |
+| `IndexVault` | The index token. In-kind mint/redeem (redeem can never be paused), fees |
+| `IndexRouter` | Mint/redeem with USDC or ETH via Aerodrome, 1% max slippage per leg |
+| `Rebalancer` | Keeper-only; trades on more than 3 points of drift, or every 30 days |
+| `IndexFeeSplitter` | Fees → 50% USDC to the Pot, 50% buys $CHIP for the ChipBurner |
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+- Spec and decisions: [docs/SPEC.md](docs/SPEC.md)
+- Trust model and open questions: [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md)
+- Deploy checklist: [docs/DEPLOY.md](docs/DEPLOY.md)
 
-## Documentation
-
-https://book.getfoundry.sh/
-
-## Usage
-
-### Build
-
-```shell
-$ forge build
 ```
-
-### Test
-
-```shell
-$ forge test
-```
-
-### Format
-
-```shell
-$ forge fmt
-```
-
-### Gas Snapshots
-
-```shell
-$ forge snapshot
-```
-
-### Anvil
-
-```shell
-$ anvil
-```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
+forge test --no-match-path "test/fork/*"   # unit + invariant tests
+./script/fork-test.sh                      # Base fork tests (needs base-forge, run in WSL)
 ```
