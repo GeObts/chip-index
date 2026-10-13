@@ -96,7 +96,7 @@ contract ChipIndexForkTest is Test {
             ts[i] = STOCK_TS;
         }
         registry = new BasketRegistry(SAFE, SEQUENCER_FEED, SLIP_FACTORY, USDC, cfg, ts);
-        vault = new IndexVault(SAFE, registry, "Chip Index", "CHIDX", 100, 100, 300, 1_000_000e18);
+        vault = new IndexVault(SAFE, registry, POLICY_REGISTRY, "Chip Index", "CHIDX", 100, 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(SAFE, vault, ISlipstreamRouter(SLIP_ROUTER), USDC, KEEPER);
         router = new IndexRouter(
             SAFE, vault, ISlipstreamRouter(SLIP_ROUTER), USDC, WETH, ETH_USD_FEED, WETH_USDC_TS, KEEPER
@@ -210,20 +210,92 @@ contract ChipIndexForkTest is Test {
         assertGt(IERC20(tokens[0]).balanceOf(SAFE), 0);
     }
 
-    /// Coinbase blocklists a receiver: every leg is credited (all 8 stocks share policy 5),
-    /// and it is claimable once lifted.
-    function test_fork_blocklistedReceiver() public {
+    /* ---------------- Coinbase blocklist (real policy 5) ---------------- */
+
+    /// The vault refuses to deliver to a Coinbase-blocklisted receiver.
+    function test_fork_blocklist_receiverRefused() public {
+        _setBlocked(bob, true);
+        assertEq(vault.blockedOn(bob), tokens[0]);
+        vm.prank(SAFE);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, bob, tokens[0]));
+        vault.redeem(10e18, bob);
+    }
+
+    /// A blocklisted holder cannot redeem, even to a clean address; nothing is burned.
+    function test_fork_blocklist_callerRefused() public {
+        vm.prank(SAFE);
+        vault.transfer(bob, 10e18);
+        _setBlocked(bob, true);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, bob, tokens[0]));
+        vault.redeem(10e18, alice);
+        assertEq(vault.balanceOf(bob), 10e18);
+    }
+
+    /// A clean caller cannot park credits with a blocklisted account.
+    function test_fork_blocklist_creditHolderRefused() public {
         _setBlocked(bob, true);
         vm.prank(SAFE);
-        uint256[] memory out = vault.redeem(10e18, bob);
-        for (uint256 i; i < N; ++i) {
-            assertEq(IERC20(tokens[i]).balanceOf(bob), 0);
-            assertEq(vault.owed(bob, tokens[i]), out[i]);
-        }
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, bob, tokens[0]));
+        vault.redeem(10e18, alice, bob);
+    }
+
+    /// Cash redeem: refused for a blocklisted caller and for a blocklisted cash recipient.
+    function test_fork_blocklist_cashRedeemRefused() public {
+        deal(USDC, alice, 1_000e6);
+        vm.startPrank(alice);
+        IERC20(USDC).approve(address(router), type(uint256).max);
+        router.mintWithUsdc(10e18, 200e6, alice, block.timestamp + 600);
+        vault.approve(address(router), type(uint256).max);
+        vm.stopPrank();
+
+        _setBlocked(bob, true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, bob, tokens[0]));
+        router.redeemToUsdc(9.9e18, 0, bob, block.timestamp + 600);
+
         _setBlocked(bob, false);
-        vm.prank(bob);
+        _setBlocked(alice, true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, alice, tokens[0]));
+        router.redeemToEth(9.9e18, 0, bob, block.timestamp + 600);
+    }
+
+    /// Credit earned while clean (NVDA paused at redeem) cannot be claimed once blocklisted;
+    /// lifting the block lets the claim through.
+    function test_fork_blocklist_claimRefusedUntilLifted() public {
+        IB20 nvda = IB20(tokens[0]);
+        _grantRole(tokens[0], nvda.PAUSE_ROLE(), address(this));
+        _grantRole(tokens[0], nvda.UNPAUSE_ROLE(), address(this));
+        IB20.PausableFeature[] memory f = new IB20.PausableFeature[](1);
+        f[0] = IB20.PausableFeature.TRANSFER;
+        nvda.pause(f);
+        vm.prank(SAFE);
+        uint256[] memory out = vault.redeem(10e18, alice);
+        nvda.unpause(f);
+        assertEq(vault.owed(alice, tokens[0]), out[0]);
+
+        _setBlocked(alice, true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, alice, tokens[0]));
         vault.claimOwed(tokens[0], bob);
-        assertEq(IERC20(tokens[0]).balanceOf(bob), out[0]);
+
+        _setBlocked(alice, false);
+        vm.prank(alice);
+        vault.claimOwed(tokens[0], alice);
+        assertEq(nvda.balanceOf(alice), out[0]);
+    }
+
+    /// Lifting a block restores redeem; also measures what the check costs in gas.
+    function test_fork_blocklist_liftedRestoresRedeem() public {
+        _setBlocked(alice, true);
+        _setBlocked(alice, false);
+        assertEq(vault.blockedOn(alice), address(0));
+        vm.prank(SAFE);
+        uint256 g = gasleft();
+        vault.redeem(10e18, alice);
+        console2.log("in-kind redeem gas (8 legs, with blocklist check)", g - gasleft());
+        assertGt(IERC20(tokens[0]).balanceOf(alice), 0);
     }
 
     /// Coinbase blocklists the VAULT: nothing can move, but redeem still burns and credits.

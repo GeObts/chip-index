@@ -29,24 +29,49 @@ contract MockERC20 is ERC20 {
     }
 }
 
-/// @notice B20 stand-in: 8 decimals, issuer pause, one blocklist checked on sender, receiver and
-///         executor (msg.sender) like Coinbase policy 5, and a multiplier that never touches balances.
+/// @notice Base PolicyRegistry stand-in: blocklists by policy id. Id 0 (ALWAYS_ALLOW) and unknown
+///         ids authorize everyone, as an empty blocklist does.
+contract MockPolicyRegistry {
+    mapping(uint64 => mapping(address => bool)) public blocked;
+
+    function setBlocked(uint64 id, address a, bool b) external {
+        blocked[id][a] = b;
+    }
+
+    function isAuthorized(uint64 id, address a) external view returns (bool) {
+        return !blocked[id][a];
+    }
+}
+
+/// @notice B20 stand-in: 8 decimals, issuer pause, and ONE blocklist policy bound to the sender,
+///         receiver and executor (msg.sender) scopes, read from a shared MockPolicyRegistry exactly
+///         like a real B20. The multiplier never touches balances.
 contract MockB20 is MockERC20 {
+    MockPolicyRegistry public immutable policies;
+    uint64 public immutable policy;
     bool public transfersPaused;
-    mapping(address => bool) public blocked;
     uint256 public multiplier = 1e18;
 
     error ContractPaused();
     error PolicyForbids(address account);
 
-    constructor(string memory n, string memory s) MockERC20(n, s, 8) {}
+    constructor(string memory n, string memory s, MockPolicyRegistry policies_, uint64 policy_) MockERC20(n, s, 8) {
+        policies = policies_;
+        policy = policy_;
+    }
+
+    /// @dev Same id on all three transfer scopes, like Coinbase's policy 5.
+    function policyId(bytes32) external view returns (uint64) {
+        return policy;
+    }
 
     function setPaused(bool p) external {
         transfersPaused = p;
     }
 
+    /// @dev Convenience: block `a` under THIS token's policy.
     function setBlocked(address a, bool b) external {
-        blocked[a] = b;
+        policies.setBlocked(policy, a, b);
     }
 
     function setMultiplier(uint256 m) external {
@@ -57,9 +82,9 @@ contract MockB20 is MockERC20 {
         // Mint/burn (test setup) bypass issuer controls.
         if (from != address(0) && to != address(0)) {
             if (transfersPaused) revert ContractPaused();
-            if (blocked[from]) revert PolicyForbids(from);
-            if (blocked[to]) revert PolicyForbids(to);
-            if (blocked[msg.sender]) revert PolicyForbids(msg.sender);
+            if (!policies.isAuthorized(policy, from)) revert PolicyForbids(from);
+            if (!policies.isAuthorized(policy, to)) revert PolicyForbids(to);
+            if (!policies.isAuthorized(policy, msg.sender)) revert PolicyForbids(msg.sender);
         }
         super._update(from, to, value);
     }

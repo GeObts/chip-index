@@ -26,6 +26,8 @@ import {OracleLib} from "./lib/OracleLib.sol";
  *         Cash mints AND cash redeems need every feed fresh. When feeds are frozen
  *         (weekends, holidays) use the vault's in-kind redeem, which never stops.
  *
+ *         Cash redeems refuse issuer-blocklisted callers and recipients (see IndexVault BLOCKLIST).
+ *
  *         Assumes 1 USDC = $1 when comparing USDC against the stock feeds.
  */
 contract IndexRouter is Ownable2Step, ReentrancyGuard {
@@ -321,6 +323,9 @@ contract IndexRouter is Ownable2Step, ReentrancyGuard {
         if (cashRedeemPaused) revert CashRedeemIsPaused();
         if (to == address(0)) revert ZeroAddress();
         registry.requireAllFresh();
+        // The vault checks the caller (as credit holder) and this router; the cash recipient is
+        // checked here, so a blocklisted account cannot redeem through a clean address or vice versa.
+        vault.requireNotBlocked(to);
     }
 
     /// @dev Pull the user's index tokens, redeem in kind to this contract (credits go to the user),

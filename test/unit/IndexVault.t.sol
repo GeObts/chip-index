@@ -148,24 +148,67 @@ contract IndexVaultTest is Fixture {
         assertEq(vault.totalOwed(address(stocks[2])), 0);
     }
 
-    /// A blocklisted receiver gets credits, which it can later send to a different address.
-    function test_redeem_blocklistedReceiver() public {
-        for (uint256 i; i < N; ++i) {
-            stocks[i].setBlocked(bob, true);
-        }
+    /* --------------------------- blocklist ---------------------------- */
+
+    /// Blocked on even ONE stock is enough to refuse the whole redeem.
+    function test_blocklist_receiverRefused() public {
+        stocks[3].setBlocked(bob, true);
+        vm.prank(safe);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, bob, address(stocks[3])));
+        vault.redeem(10e18, bob);
+    }
+
+    /// A blocklisted holder cannot redeem, not even to a clean address.
+    function test_blocklist_callerRefused() public {
         vm.prank(safe);
         vault.transfer(bob, 10e18);
+        stocks[0].setBlocked(bob, true);
         vm.prank(bob);
-        uint256[] memory out = vault.redeem(10e18, bob);
-        for (uint256 i; i < N; ++i) {
-            assertEq(vault.owed(bob, address(stocks[i])), out[i]);
-        }
-        // DOCUMENTED BEHAVIOUR (open owner decision, docs/ASSUMPTIONS.md A-6): the B20 checks the
-        // token's from/to/msg.sender, and for a claim those are the vault and `alice`, not bob.
-        // So a blocklisted holder can still route a credit to another address.
-        vm.prank(bob);
-        vault.claimOwed(address(stocks[0]), alice);
-        assertEq(stocks[0].balanceOf(alice), out[0]);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, bob, address(stocks[0])));
+        vault.redeem(10e18, alice);
+        assertEq(vault.balanceOf(bob), 10e18, "nothing burned");
+    }
+
+    /// Nor can a clean caller name a blocklisted account to hold the credits.
+    function test_blocklist_creditHolderRefused() public {
+        stocks[7].setBlocked(bob, true);
+        vm.prank(safe);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, bob, address(stocks[7])));
+        vault.redeem(10e18, alice, bob);
+    }
+
+    /// Credits earned while clean cannot be claimed once blocklisted, or sent to a blocked address.
+    function test_blocklist_claimRefused() public {
+        stocks[2].setPaused(true);
+        vm.prank(safe);
+        uint256[] memory out = vault.redeem(10e18, alice);
+        stocks[2].setPaused(false);
+
+        stocks[2].setBlocked(alice, true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, alice, address(stocks[2])));
+        vault.claimOwed(address(stocks[2]), bob);
+
+        stocks[2].setBlocked(alice, false);
+        stocks[2].setBlocked(bob, true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, bob, address(stocks[2])));
+        vault.claimOwed(address(stocks[2]), bob);
+
+        vm.prank(alice);
+        vault.claimOwed(address(stocks[2]), alice);
+        assertEq(stocks[2].balanceOf(alice), out[2]);
+    }
+
+    /// Lifting the block restores redeem.
+    function test_blocklist_unblockRestoresRedeem() public {
+        stocks[0].setBlocked(alice, true);
+        assertEq(vault.blockedOn(alice), address(stocks[0]));
+        stocks[0].setBlocked(alice, false);
+        assertEq(vault.blockedOn(alice), address(0));
+        vm.prank(safe);
+        vault.redeem(10e18, alice);
+        assertGt(stocks[0].balanceOf(alice), 0);
     }
 
     /// The vault itself blocklisted on one stock: that stock is frozen, everything else works.

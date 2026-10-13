@@ -11,6 +11,34 @@ import {Rebalancer} from "../src/Rebalancer.sol";
 import {ISlipstreamRouter} from "../src/interfaces/ISlipstreamRouter.sol";
 import {PoolKey} from "../src/interfaces/IUniswapV4.sol";
 
+/* ========================================================================== */
+/*                LAUNCH CONFIG: EDIT HERE BEFORE DEPLOYING                   */
+/* ========================================================================== */
+/// @notice Every owner-chosen launch value lives in this one block. The deploy and the seed
+///         scripts both read it, and `Deploy.verify` checks the deployed contracts against it.
+library LaunchConfig {
+    // PLACEHOLDERS, to be confirmed by the owner before deploy.
+    string internal constant NAME = "Chip Index";
+    string internal constant SYMBOL = "CHIDX";
+
+    /// Total cap on index tokens in existence, for ALL holders together (no per-wallet limit).
+    /// 2,500 tokens = $25,000 at the $10 launch price. The Safe can raise it later (setMintCap).
+    uint256 internal constant MINT_CAP_TOKENS = 2_500;
+
+    /// Most USDC one $CHIP buy may spend. Fork-measured 2026-10-12: a $100 buy fills 0.68% worse
+    /// than spot (pool fee ~0.38% + impact ~0.30%), inside the 1% limit; $250 was 1.13%.
+    uint256 internal constant MAX_CHIP_BUY_USDC = 100;
+
+    /// First mint by the Safe: $125 of each of the 8 stocks ($1,000) for 100 index tokens ($10).
+    uint256 internal constant SEED_USD_PER_STOCK = 125;
+    uint256 internal constant SEED_TOKENS = 100;
+
+    // Fees (bps). Hard caps live in IndexVault: 200 / 200 / 500.
+    uint16 internal constant MINT_FEE_BPS = 100;
+    uint16 internal constant REDEEM_FEE_BPS = 100;
+    uint16 internal constant MGMT_FEE_BPS = 300;
+}
+
 /// @notice Every Base mainnet address the deploy uses, in one place.
 ///         Basket + feeds verified 2026-10-12 (Coinbase API, all pages, and onchain descriptions).
 library Addrs {
@@ -27,6 +55,7 @@ library Addrs {
     address internal constant ETH_USD_FEED = 0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
     address internal constant POOL_MANAGER = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
     address internal constant CHIP_HOOK = 0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544;
+    address internal constant POLICY_REGISTRY = 0x8453000000000000000000000000000000000002;
     uint24 internal constant CHIP_POOL_FEE = 0x800000; // dynamic-fee flag
     int24 internal constant CHIP_POOL_TS = 200;
     int24 internal constant STOCK_USDC_TS = 10; // every B20/USDC pool with real depth
@@ -54,9 +83,7 @@ library Addrs {
  *         them, and checks the result. The deploy wallet ends up owning NOTHING.
  *
  *         It does NOT seed the index: the first mint comes from the Safe (script/SafeSeed.s.sol).
- *
- *         Requires env: INDEX_NAME, INDEX_SYMBOL, MINT_CAP (whole index tokens),
- *         MAX_CHIP_BUY_USDC (whole USDC). There are no defaults: the owner picks each one.
+ *         All owner-chosen values come from `LaunchConfig` at the top of this file.
  *
  *         MUST be simulated with Base's forge (the registry reads B20 decimals):
  *             base-forge script script/Deploy.s.sol --rpc-url $BASE_RPC_URL           (dry run)
@@ -78,17 +105,21 @@ contract Deploy is Script {
         uint256 maxChipBuyUsdc; // 6-dec USDC
     }
 
-    uint16 internal constant MINT_FEE_BPS = 100;
-    uint16 internal constant REDEEM_FEE_BPS = 100;
-    uint16 internal constant MGMT_FEE_BPS = 300;
+    uint16 internal constant MINT_FEE_BPS = LaunchConfig.MINT_FEE_BPS;
+    uint16 internal constant REDEEM_FEE_BPS = LaunchConfig.REDEEM_FEE_BPS;
+    uint16 internal constant MGMT_FEE_BPS = LaunchConfig.MGMT_FEE_BPS;
+
+    function launchParams() public pure returns (Params memory) {
+        return Params({
+            name: LaunchConfig.NAME,
+            symbol: LaunchConfig.SYMBOL,
+            mintCap: LaunchConfig.MINT_CAP_TOKENS * 1e18,
+            maxChipBuyUsdc: LaunchConfig.MAX_CHIP_BUY_USDC * 1e6
+        });
+    }
 
     function run() external returns (Deployed memory d) {
-        Params memory p = Params({
-            name: vm.envString("INDEX_NAME"),
-            symbol: vm.envString("INDEX_SYMBOL"),
-            mintCap: vm.envUint("MINT_CAP") * 1e18,
-            maxChipBuyUsdc: vm.envUint("MAX_CHIP_BUY_USDC") * 1e6
-        });
+        Params memory p = launchParams();
         require(Addrs.SAFE.code.length > 0, "Safe has no code");
 
         vm.startBroadcast();
@@ -103,7 +134,15 @@ contract Deploy is Script {
         (BasketRegistry.AssetConfig[] memory cfg, int24[] memory ts) = Addrs.basket();
         d.registry = new BasketRegistry(Addrs.SAFE, Addrs.SEQUENCER_FEED, Addrs.SLIP_FACTORY, Addrs.USDC, cfg, ts);
         d.vault = new IndexVault(
-            Addrs.SAFE, d.registry, p.name, p.symbol, MINT_FEE_BPS, REDEEM_FEE_BPS, MGMT_FEE_BPS, p.mintCap
+            Addrs.SAFE,
+            d.registry,
+            Addrs.POLICY_REGISTRY,
+            p.name,
+            p.symbol,
+            MINT_FEE_BPS,
+            REDEEM_FEE_BPS,
+            MGMT_FEE_BPS,
+            p.mintCap
         );
         d.rebalancer = new Rebalancer(Addrs.SAFE, d.vault, ISlipstreamRouter(Addrs.SLIP_ROUTER), Addrs.USDC, Addrs.KEEPER);
         d.router = new IndexRouter(
@@ -149,6 +188,8 @@ contract Deploy is Script {
 
         require(d.registry.vault() == address(d.vault), "registry -> vault");
         require(address(d.vault.registry()) == address(d.registry), "vault -> registry");
+        require(address(d.vault.policyRegistry()) == Addrs.POLICY_REGISTRY, "vault -> policy registry");
+        require(keccak256(bytes(d.vault.name())) == keccak256(bytes(p.name)), "name");
         require(d.vault.feeRecipient() == address(d.splitter), "fee recipient");
         require(d.vault.rebalancer() == address(d.rebalancer), "rebalancer");
         require(address(d.router.vault()) == address(d.vault), "router -> vault");

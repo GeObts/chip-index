@@ -41,14 +41,16 @@ All B20 liquidity is on Aerodrome Slipstream (factory B `0xf8f2eB49…61Ef`, rou
 2026-10-12. WETH/USDC uses tick spacing 50 ($1.8M USDC + 2,514 WETH). Every leg must fill within 1%
 of Chainlink, so pool depth caps how large a single cash mint can be.
 
-## A-6 OPEN DECISION — blocklisted holders and the wrapper
-The index token is an ordinary ERC-20, and the vault (not the holder) moves the stocks. So someone
-Coinbase has blocklisted can still hold index tokens, redeem them, and have the stocks or a credit
-sent to an unblocked address (`test_redeem_blocklistedReceiver` documents this). Every DeFi wrapper
-behaves this way, but it is the scenario most likely to make Coinbase blocklist the whole vault
-(A-4), which would hurt every holder.
-Option: the vault checks policy 5 for the caller and receiver on redeem/claim, and refuses to deliver
-or route credits for blocklisted accounts. **Owner to decide.**
+## A-6 DECIDED (owner, 2026-10-12): blocklisted accounts cannot redeem
+Before every in-kind or cash redeem, the vault checks the caller, the receiver and the credit holder
+against every listed stock's SENDER/RECEIVER/EXECUTOR policies through Base's PolicyRegistry
+(`isAuthorized`). It reverts `Blocklisted(account, token)` if any of them is blocked by any stock.
+Claiming a credit checks the claimant and the destination for that stock. The Router also checks the
+cash recipient. Nothing is burned when a redeem is refused.
+**Remaining gap (not in scope of the decision):** the index token itself is freely transferable, so
+a blocklisted holder could transfer index tokens to a clean address that then redeems. Closing that
+would mean blocklist checks on index-token transfers. That is possible, but it is a larger change
+to how the token behaves.
 
 ## A-7 Fees
 - Mint 1% / redeem 1% (cap 2% each). Taken in index tokens and sent to the IndexFeeSplitter; the

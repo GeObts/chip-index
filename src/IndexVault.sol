@@ -11,6 +11,15 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BasketRegistry} from "./BasketRegistry.sol";
 import {Timelock} from "./lib/Timelock.sol";
 
+/// @dev The two B20 surfaces the blocklist check needs (base-std IB20 / IPolicyRegistry).
+interface IB20Policy {
+    function policyId(bytes32 policyScope) external view returns (uint64);
+}
+
+interface IPolicyRegistryView {
+    function isAuthorized(uint64 policyId, address account) external view returns (bool);
+}
+
 interface IRebalanceCallback {
     /// @notice Called by the vault mid-trade. `amountIn` of `tokenIn` has already been sent to
     ///         the caller; it must deliver `tokenOut` back to the vault before returning.
@@ -30,6 +39,13 @@ interface IRebalanceCallback {
  *         freshness check on this path. If a single stock cannot be sent (issuer paused it, or a
  *         blocklist rejects the vault or the receiver), that leg is CREDITED to `creditTo` instead
  *         of reverting the whole redeem. The credit is claimable later with `claimOwed`.
+ *
+ *         BLOCKLIST: the vault refuses to deliver stock to, or on behalf of, any address the issuer
+ *         has blocklisted. Before every redeem it checks the caller, the receiver and the credit
+ *         holder against every listed stock's transfer policies (sender, receiver, executor) in
+ *         Base's PolicyRegistry, and reverts `Blocklisted` if any of them is not authorized. A claim
+ *         of credited stock gets the same check for that stock. This deliberately makes redeem
+ *         unavailable to blocklisted accounts: it is the issuer's rule, not an admin switch here.
  *
  *         ACCOUNTING: `held[token]` is the vault's own book of what backs the index. Credits
  *         (`totalOwed`) are kept separately and are not index backing. `sync` re-reads the real
@@ -53,8 +69,13 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
 
     bytes32 public constant ACTION_REBALANCER = keccak256("REBALANCER");
     bytes32 public constant ACTION_FEE_RECIPIENT = keccak256("FEE_RECIPIENT");
+    bytes32 public constant TRANSFER_SENDER_POLICY = keccak256("TRANSFER_SENDER_POLICY");
+    bytes32 public constant TRANSFER_RECEIVER_POLICY = keccak256("TRANSFER_RECEIVER_POLICY");
+    bytes32 public constant TRANSFER_EXECUTOR_POLICY = keccak256("TRANSFER_EXECUTOR_POLICY");
 
     BasketRegistry public immutable registry;
+    /// @notice Base's PolicyRegistry precompile (0x8453...0002 on mainnet).
+    IPolicyRegistryView public immutable policyRegistry;
     address private immutable _deployer;
 
     mapping(address token => uint256) public held;
@@ -108,10 +129,12 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     error NothingOwed();
     error NotDeployer();
     error AlreadyWired();
+    error Blocklisted(address account, address token);
 
     constructor(
         address owner_,
         BasketRegistry registry_,
+        address policyRegistry_,
         string memory name_,
         string memory symbol_,
         uint16 mintFeeBps_,
@@ -119,8 +142,9 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         uint16 mgmtFeeBps_,
         uint256 mintCap_
     ) ERC20(name_, symbol_) Ownable(owner_) {
-        if (address(registry_) == address(0)) revert ZeroAddress();
+        if (address(registry_) == address(0) || policyRegistry_ == address(0)) revert ZeroAddress();
         registry = registry_;
+        policyRegistry = IPolicyRegistryView(policyRegistry_);
         _deployer = msg.sender;
         _setFees(mintFeeBps_, redeemFeeBps_, mgmtFeeBps_);
         mintCap = mintCap_;
@@ -234,6 +258,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     {
         if (shares == 0) revert ZeroShares();
         if (receiver == address(0) || creditTo == address(0)) revert ZeroAddress();
+        _requireNotBlocked(msg.sender, receiver, creditTo);
         _accrue();
 
         address[] memory list;
@@ -262,10 +287,65 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         if (to == address(0)) revert ZeroAddress();
         amount = owed[msg.sender][token];
         if (amount == 0) revert NothingOwed();
+        if (isBlocked(msg.sender, token)) revert Blocklisted(msg.sender, token);
+        if (isBlocked(to, token)) revert Blocklisted(to, token);
         owed[msg.sender][token] = 0;
         totalOwed[token] -= amount;
         IERC20(token).safeTransfer(to, amount);
         emit OwedClaimed(msg.sender, token, to, amount);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*                             Blocklist                               */
+    /* ------------------------------------------------------------------ */
+
+    /// @notice True if `account` is not authorized under any of `token`'s transfer policies.
+    function isBlocked(address account, address token) public view returns (bool) {
+        IB20Policy t = IB20Policy(token);
+        return !policyRegistry.isAuthorized(t.policyId(TRANSFER_SENDER_POLICY), account)
+            || !policyRegistry.isAuthorized(t.policyId(TRANSFER_RECEIVER_POLICY), account)
+            || !policyRegistry.isAuthorized(t.policyId(TRANSFER_EXECUTOR_POLICY), account);
+    }
+
+    /// @notice The first listed stock that blocklists `account`, or address(0) if none does.
+    function blockedOn(address account) public view returns (address) {
+        address[] memory list = registry.tokens();
+        for (uint256 i; i < list.length; ++i) {
+            if (isBlocked(account, list[i])) return list[i];
+        }
+        return address(0);
+    }
+
+    /// @notice Reverts `Blocklisted` if any listed stock blocklists `account`. Used by the Router.
+    function requireNotBlocked(address account) external view {
+        address t = blockedOn(account);
+        if (t != address(0)) revert Blocklisted(account, t);
+    }
+
+    /// @dev One pass: every listed stock x 3 scopes, each DISTINCT policy id queried once per
+    ///      distinct account (Coinbase uses one id for all 24 slots today, so that is 1-3 queries).
+    function _requireNotBlocked(address a, address b, address c) internal view {
+        address[] memory list = registry.tokens();
+        bytes32[3] memory scopes = [TRANSFER_SENDER_POLICY, TRANSFER_RECEIVER_POLICY, TRANSFER_EXECUTOR_POLICY];
+        uint64[] memory seen = new uint64[](list.length * 3);
+        uint256 nSeen;
+        for (uint256 i; i < list.length; ++i) {
+            for (uint256 s; s < 3; ++s) {
+                uint64 id = IB20Policy(list[i]).policyId(scopes[s]);
+                bool dup;
+                for (uint256 k; k < nSeen; ++k) {
+                    if (seen[k] == id) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                seen[nSeen++] = id;
+                if (!policyRegistry.isAuthorized(id, a)) revert Blocklisted(a, list[i]);
+                if (b != a && !policyRegistry.isAuthorized(id, b)) revert Blocklisted(b, list[i]);
+                if (c != a && c != b && !policyRegistry.isAuthorized(id, c)) revert Blocklisted(c, list[i]);
+            }
+        }
     }
 
     /* ------------------------------------------------------------------ */

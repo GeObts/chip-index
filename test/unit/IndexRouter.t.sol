@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {IndexRouter} from "../../src/IndexRouter.sol";
+import {IndexVault} from "../../src/IndexVault.sol";
 import {Fixture} from "../Fixture.sol";
 
 contract IndexRouterTest is Fixture {
@@ -137,6 +138,28 @@ contract IndexRouterTest is Fixture {
         router.redeemToUsdc(shares, 0, alice, deadline);
         assertGt(vault.owed(alice, address(stocks[3])), 0);
         assertEq(vault.owed(address(router), address(stocks[3])), 0);
+    }
+
+    /* --------------------------- blocklist --------------------------- */
+
+    function test_blocklist_cashRedeemCallerRefused() public {
+        vm.prank(alice);
+        router.mintWithUsdc(10e18, 200e6, alice, deadline);
+        uint256 shares = vault.balanceOf(alice);
+        stocks[4].setBlocked(alice, true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, alice, address(stocks[4])));
+        router.redeemToUsdc(shares, 0, bob, deadline);
+    }
+
+    function test_blocklist_cashRedeemRecipientRefused() public {
+        vm.prank(alice);
+        router.mintWithUsdc(10e18, 200e6, alice, deadline);
+        uint256 shares = vault.balanceOf(alice);
+        stocks[4].setBlocked(bob, true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, bob, address(stocks[4])));
+        router.redeemToEth(shares, 0, bob, deadline);
     }
 
     /* ----------------------------- pause ----------------------------- */

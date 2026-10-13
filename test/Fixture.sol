@@ -16,6 +16,7 @@ import {
     MockB20,
     MockChipBurner,
     MockERC20,
+    MockPolicyRegistry,
     MockPoolManager,
     MockSlipstreamFactory,
     MockSlipstreamRouter,
@@ -48,6 +49,7 @@ abstract contract Fixture is Test {
     MockSlipstreamRouter internal swap;
     MockPoolManager internal poolManager;
     MockChipBurner internal burner;
+    MockPolicyRegistry internal policies;
 
     BasketRegistry internal registry;
     IndexVault internal vault;
@@ -69,6 +71,7 @@ abstract contract Fixture is Test {
         swap = new MockSlipstreamRouter(address(factory));
         poolManager = new MockPoolManager(1_000_000e18); // 1 WETH = 1M CHIP
         burner = new MockChipBurner(chip);
+        policies = new MockPolicyRegistry();
 
         swap.setPrice(address(usdc), 1e18);
         swap.setPrice(address(weth), 2_600e18);
@@ -77,7 +80,8 @@ abstract contract Fixture is Test {
         BasketRegistry.AssetConfig[] memory cfg = new BasketRegistry.AssetConfig[](N);
         int24[] memory ts = new int24[](N);
         for (uint256 i; i < N; ++i) {
-            stocks[i] = new MockB20(tickers[i], string.concat(tickers[i], "c"));
+            // Each mock stock has its own policy id (i + 1) so tests can block on one stock only.
+            stocks[i] = new MockB20(tickers[i], string.concat(tickers[i], "c"), policies, uint64(i + 1));
             feeds[i] = new MockAggregator(8, prices8[i]);
             factory.setPool(address(stocks[i]), address(usdc), TS);
             swap.setPrice(address(stocks[i]), uint256(prices8[i]) * 1e10);
@@ -86,7 +90,7 @@ abstract contract Fixture is Test {
         }
 
         registry = new BasketRegistry(safe, address(sequencer), address(factory), address(usdc), cfg, ts);
-        vault = new IndexVault(safe, registry, "Chip Index", "CHIDX", 100, 100, 300, 1_000_000e18);
+        vault = new IndexVault(safe, registry, address(policies), "Chip Index", "CHIDX", 100, 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(safe, vault, ISlipstreamRouter(address(swap)), address(usdc), keeper);
         router = new IndexRouter(
             safe,

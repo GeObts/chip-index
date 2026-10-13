@@ -110,7 +110,7 @@ contract BasketRegistryTest is Fixture {
     /// Removing a held stock keeps it listed at weight 0 until the vault holds none; adding a new
     /// one lists it at its target with nothing held yet.
     function test_removeAndAddTicker() public {
-        MockB20 coin = new MockB20("COIN", "COINc");
+        MockB20 coin = new MockB20("COIN", "COINc", policies, 99);
         MockAggregator coinFeed = new MockAggregator(8, 300e8);
         factory.setPool(address(coin), address(usdc), TS);
 
