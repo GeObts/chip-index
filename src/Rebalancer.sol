@@ -19,8 +19,10 @@ import {ISlipstreamRouter} from "./interfaces/ISlipstreamRouter.sol";
  *         Each trade must sell an overweight stock and buy an underweight one, and the
  *         rebalance as a whole must reduce the total drift, so the keeper cannot churn.
  *
- *         Trades route stock -> USDC -> stock on Aerodrome. Price protection is enforced by the
- *         VAULT (Chainlink, max 1% by default, hard cap 2%), plus the keeper's own minOut.
+ *         Trades route stock -> USDC -> stock on Aerodrome. Price protection is layered: the swap
+ *         carries a Chainlink-derived minimum (value in minus the vault's `maxTradeSlippageBps`),
+ *         the VAULT re-checks value in vs out after the trade (max 1% by default, hard cap 2%),
+ *         and the keeper's own minOut applies too.
  */
 contract Rebalancer is Ownable2Step, ReentrancyGuard, IRebalanceCallback {
     using SafeERC20 for IERC20;
@@ -33,6 +35,7 @@ contract Rebalancer is Ownable2Step, ReentrancyGuard, IRebalanceCallback {
     }
 
     uint256 public constant WAD = 1e18;
+    uint256 public constant BPS = 10_000;
     uint256 public constant DRIFT_THRESHOLD = 3e16; // 3 percentage points
     uint256 public constant SCHEDULE = 30 days;
 
@@ -110,6 +113,11 @@ contract Rebalancer is Ownable2Step, ReentrancyGuard, IRebalanceCallback {
     /// @inheritdoc IRebalanceCallback
     function onRebalanceTrade(address tokenIn, uint256 amountIn, address tokenOut, bytes calldata) external {
         if (msg.sender != address(vault)) revert NotVault();
+        // The swap itself refuses to fill below Chainlink value minus the vault's trade slippage,
+        // so a bad fill reverts inside the router. The vault re-checks value after the callback.
+        uint256 minOut = registry.amountForUsd(
+            tokenOut, registry.valueUsd(tokenIn, amountIn) * (BPS - vault.maxTradeSlippageBps()) / BPS
+        );
         IERC20(tokenIn).forceApprove(address(swapRouter), amountIn);
         swapRouter.exactInput(
             ISlipstreamRouter.ExactInputParams({
@@ -119,7 +127,7 @@ contract Rebalancer is Ownable2Step, ReentrancyGuard, IRebalanceCallback {
                 recipient: address(vault),
                 deadline: _deadline,
                 amountIn: amountIn,
-                amountOutMinimum: 0 // the vault checks value and the keeper's minOut after the callback
+                amountOutMinimum: minOut
             })
         );
         IERC20(tokenIn).forceApprove(address(swapRouter), 0);

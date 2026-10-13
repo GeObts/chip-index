@@ -30,7 +30,8 @@ recipient. A stock leg that cannot be delivered is credited to `creditTo` and cl
   once**. Redeems still burn and credit, and the credits pay out if the block is lifted.
   `test_fork_blocklistedVault`.
 - The issuer can pause transfers per token (`test_fork_pausedToken`) and can seize from any holder,
-  the vault included. `sync` writes a seizure down pro-rata for all holders.
+  the vault included. `sync` writes a seizure down pro-rata for index holders and credit holders
+  alike (credits are shares of a per-token pool, so every credit scales at once).
 - Base's upcoming **Denim** upgrade (no date yet) extends the executor check to plain `transfer`.
   The vault and router are not allowlisted anywhere, so if Coinbase ever switched policy 5 from a
   blocklist to an allowlist, every contract here would stop moving stock.
@@ -59,7 +60,8 @@ index token a normal composable ERC-20.
   2s) as newly minted index tokens. Continuous minting dilutes holders by about 2.96% of value a year.
 - The splitter sends 50% of the USDC to the Pot (`0x3918…855B`) and spends 50% on $CHIP, which goes
   to the ChipBurner (`0x7Bc1…5C0`). $CHIP has no onchain TWAP (the Doppler hook keeps no oracle),
-  so each buy is limited by the keeper's `minChipOut` and `maxChipBuyUsdc` per call.
+  so each buy is limited by the keeper's `minChipOut` (from a live quote; the contract rejects 0)
+  and `maxChipBuyUsdc` per call.
 
 ## A-8 Keeper powers
 The keeper (`0x6571…95B9`) can rebalance (only within the drift/schedule rules and vault-enforced

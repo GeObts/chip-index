@@ -29,7 +29,7 @@ also means a new vault.
   can always burn their index tokens for their share of every stock (only Coinbase's own blocklist
   can refuse a specific account, see REVIEW_PACKAGE §4).
 - **Credits stay claimable.** A stock leg that could not be delivered at redeem stays in
-  `owed[account][token]` and is collected with `claimOwed(token, to)` whenever the token can move.
+  `owed(account, token)` and is collected with `claimOwed(token, to)` whenever the token can move.
 - Nobody can take the stock out of the old vault for themselves. (Two indirect owner paths that
   need the 48h timelock are listed in the security self-review; the 48h is the users' window.)
 

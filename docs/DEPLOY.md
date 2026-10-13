@@ -47,4 +47,8 @@ Downloads, review it, then load it in the Safe app. Rehearsed on the fork: $1,00
   cash mints and rebalances can trade it.
 - The keeper runs `rebalancer.eligible()` → `rebalance(...)`, `splitter.redeemFees()` →
   `sellForUsdc(...)` → `buyAndBurn(...)` (at most $100 per call).
+- `buyAndBurn`'s `minChipOut` must come from a live quote taken just before sending: `eth_call`
+  `buyAndBurn(usdcIn, 1, deadline)` from the keeper address, read `chipOut`, and send
+  `minChipOut = chipOut × 0.99`. The contract rejects 0. **The Chip Index keeper script does not
+  exist yet; build it before launch.**
 - Raising the cap later: Safe calls `vault.setMintCap(newCapInTokens * 1e18)`.

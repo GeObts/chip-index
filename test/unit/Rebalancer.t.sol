@@ -105,6 +105,34 @@ contract RebalancerTest is Fixture {
         rebalancer.rebalance(t, deadline);
     }
 
+    /// The swap itself now carries a Chainlink minimum (value in minus maxTradeSlippageBps), so a
+    /// bad fill is refused inside the swap router, before the vault's own check even runs.
+    function test_rebalance_swapCarriesChainlinkMinimum() public {
+        _rally(0, 40);
+        Rebalancer.Trade[] memory t = _trade(0, 1, 40e18);
+        uint256 expectedMin = registry.amountForUsd(
+            address(stocks[1]),
+            registry.valueUsd(address(stocks[0]), t[0].amountIn) * (10_000 - vault.maxTradeSlippageBps()) / 10_000
+        );
+        assertGt(expectedMin, 0);
+        vm.prank(keeper);
+        rebalancer.rebalance(t, deadline);
+        assertEq(swap.lastAmountOutMinimum(), expectedMin, "min-out sent to the swap");
+
+        // A fill 1.5% under Chainlink (limit 1%) now fails in the swap router itself.
+        _rally(0, 80);
+        swap.setSkewBps(150);
+        t = _trade(0, 2, 40e18); // MSTR is no longer underweight; GOOGL is
+        vm.prank(keeper);
+        vm.expectRevert("Too little received");
+        rebalancer.rebalance(t, deadline);
+
+        // Within the limit (0.9%) it fills.
+        swap.setSkewBps(90);
+        vm.prank(keeper);
+        rebalancer.rebalance(t, deadline);
+    }
+
     function test_rebalance_keeperMinOutEnforced() public {
         _rally(0, 40);
         Rebalancer.Trade[] memory t = _trade(0, 1, 40e18);

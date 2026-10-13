@@ -58,6 +58,15 @@ contract Handler is Test {
         vault.claimOwed(t, a);
     }
 
+    /// @dev An issuer seizure of up to 100% of the vault's balance, then anyone's sync.
+    ///      (Between the two the books are briefly ahead of the balance; sync is what fixes that.)
+    function seize(uint256 i, uint256 pct) external {
+        MockB20 s = stocks[i % 8];
+        uint256 bal = s.balanceOf(address(vault));
+        s.seize(address(vault), address(0xdead), bal * bound(pct, 0, 100) / 100);
+        vault.sync(address(s));
+    }
+
     function warp(uint256 dt) external {
         vm.warp(block.timestamp + bound(dt, 1, 30 days));
     }
@@ -84,7 +93,8 @@ contract IndexInvariantsTest is Fixture {
         }
     }
 
-    /// Per-account credits add up to the per-token total.
+    /// Per-account credits never add up to more than the per-token total, and the gap is only
+    /// rounding (each account rounds down by under one unit).
     function invariant_creditsAddUp() public view {
         for (uint256 i; i < N; ++i) {
             address t = address(stocks[i]);
@@ -92,7 +102,8 @@ contract IndexInvariantsTest is Fixture {
             for (uint256 k; k < 3; ++k) {
                 sum += vault.owed(handler.actors(k), t);
             }
-            assertEq(sum, vault.totalOwed(t));
+            assertLe(sum, vault.totalOwed(t));
+            assertLe(vault.totalOwed(t) - sum, 5);
         }
     }
 

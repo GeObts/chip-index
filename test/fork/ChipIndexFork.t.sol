@@ -391,6 +391,45 @@ contract ChipIndexForkTest is ChipIndexForkBase {
         assertEq(nvda.balanceOf(alice), out[0]);
     }
 
+    /// The issuer seizes half the vault's NVDA while a credit is outstanding: `sync` shares the
+    /// loss between index holders and the credit holder, and both still get paid in full.
+    function test_fork_seizureWithOutstandingCredit() public {
+        // The live precompile (base-anvil v1.1.0 fork) rejects SEIZE_ROLE(), SEIZE_EXEMPT_POLICY()
+        // and seizeWithMemo (custom error 0xf916d81b), so the seizure is simulated: the vault's
+        // NVDA is moved out by a transfer pranked as the vault, which has the same effect on the
+        // vault's balance. The credit is created while NVDA is paused and is still outstanding.
+        IB20 nvda = IB20(tokens[0]);
+        _grantRole(tokens[0], nvda.PAUSE_ROLE(), address(this));
+        _grantRole(tokens[0], nvda.UNPAUSE_ROLE(), address(this));
+        IB20.PausableFeature[] memory f = new IB20.PausableFeature[](1);
+        f[0] = IB20.PausableFeature.TRANSFER;
+        nvda.pause(f);
+
+        vm.prank(SAFE);
+        uint256 credit = vault.redeem(30e18, alice)[0];
+        uint256 h = vault.held(tokens[0]);
+        uint256 bal = nvda.balanceOf(address(vault));
+        assertEq(bal, h + credit);
+
+        nvda.unpause(f); // the credit stays outstanding until alice claims
+        vm.prank(address(vault));
+        nvda.transfer(address(0xdead), bal / 2);
+        vault.sync(tokens[0]);
+        uint256 left = bal - bal / 2;
+        assertEq(vault.held(tokens[0]), h * left / bal);
+        assertEq(vault.totalOwed(tokens[0]), credit * left / bal);
+        assertEq(vault.owed(alice, tokens[0]), credit * left / bal, "credit written down");
+        assertLe(vault.held(tokens[0]) + vault.totalOwed(tokens[0]), nvda.balanceOf(address(vault)));
+
+        vm.prank(alice);
+        uint256 claimed = vault.claimOwed(tokens[0], alice);
+        assertEq(nvda.balanceOf(alice), claimed);
+        uint256 rest = vault.balanceOf(SAFE);
+        vm.prank(SAFE);
+        vault.redeem(rest, SAFE);
+        console2.log("credit before / after the 50% seizure", credit, claimed);
+    }
+
     /// A corporate action changes NVDA's multiplier. Raw balances, the vault's books, NAV
     /// (the feed is total-return) and redeem amounts are all unchanged.
     function test_fork_multiplierChange() public {
@@ -411,6 +450,62 @@ contract ChipIndexForkTest is ChipIndexForkBase {
         assertEq(afterAmts[0], before[0]);
         vm.prank(SAFE);
         vault.redeem(10e18, SAFE);
+    }
+
+    /// The rebalance swap carries a Chainlink-derived minimum (value in minus 1%), and the real
+    /// Aerodrome router enforces it: with the buy-side feed reading 3% low, so Chainlink expects
+    /// 3% more MSTR than the pool can give, the router itself refuses the fill before the vault's
+    /// own check is reached. With the real prices the exact minimum is passed and the trade fills.
+    function test_fork_rebalanceSwapHasChainlinkMinimum() public {
+        _give(tokens[0], address(vault), registry.amountForUsd(tokens[0], 60e18));
+        vault.sync(tokens[0]);
+        Rebalancer.Trade[] memory t = new Rebalancer.Trade[](1);
+        t[0] = Rebalancer.Trade(tokens[0], tokens[1], registry.amountForUsd(tokens[0], 50e18), 0);
+        uint256 deadline = block.timestamp + 600;
+
+        uint256 snap = vm.snapshotState();
+        _scaleFeed(feedAddrs[1], 97);
+        vm.prank(KEEPER);
+        vm.expectRevert(bytes("Too little received"));
+        rebalancer.rebalance(t, deadline);
+        vm.revertToState(snap);
+        _freshenFeeds(); // mocked calls survive a state revert; back to the real prices
+
+        uint256 minOut = _expectRebalanceSwap(tokens[0], tokens[1], t[0].amountIn, deadline);
+        uint256 navBefore = vault.navUsd();
+        uint256 mstrBefore = vault.held(tokens[1]);
+        vm.prank(KEEPER);
+        rebalancer.rebalance(t, deadline);
+        console2.log("swap minimum / MSTR received", minOut, vault.held(tokens[1]) - mstrBefore);
+        assertGe(vault.held(tokens[1]) - mstrBefore, minOut);
+        console2.log("NAV before / after rebalance with swap minimum", navBefore, vault.navUsd());
+        assertGe(vault.navUsd() * 10_000, navBefore * 9_900, "lost at most 1% of the traded value");
+    }
+
+    /// Make `feed` read `pct`% of its current answer (still fresh).
+    function _scaleFeed(address feed, int256 pct) internal {
+        (uint80 r, int256 a, uint256 s, uint256 u, uint80 air) = IAggregatorV3(feed).latestRoundData();
+        vm.mockCall(
+            feed, abi.encodeWithSelector(IAggregatorV3.latestRoundData.selector), abi.encode(r, a * pct / 100, s, u, air)
+        );
+    }
+
+    /// Expect the Rebalancer to call Aerodrome with exactly the Chainlink-derived minimum.
+    function _expectRebalanceSwap(address sell, address buy, uint256 amountIn, uint256 deadline)
+        internal
+        returns (uint256 minOut)
+    {
+        minOut = registry.amountForUsd(
+            buy, registry.valueUsd(sell, amountIn) * (10_000 - vault.maxTradeSlippageBps()) / 10_000
+        );
+        ISlipstreamRouter.ExactInputParams memory p = ISlipstreamRouter.ExactInputParams({
+            path: abi.encodePacked(sell, registry.usdcTickSpacing(sell), USDC, registry.usdcTickSpacing(buy), buy),
+            recipient: address(vault),
+            deadline: deadline,
+            amountIn: amountIn,
+            amountOutMinimum: minOut
+        });
+        vm.expectCall(SLIP_ROUTER, abi.encodeCall(ISlipstreamRouter.exactInput, (p)));
     }
 
     /// Someone donates NVDA: after `sync` NVDA is >3 points overweight and the keeper

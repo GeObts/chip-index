@@ -49,7 +49,8 @@ interface IRebalanceCallback {
  *
  *         ACCOUNTING: `held[token]` is the vault's own book of what backs the index. Credits
  *         (`totalOwed`) are kept separately and are not index backing. `sync` re-reads the real
- *         balance, so donations go to holders and an issuer seizure is written down for everyone.
+ *         balance, so donations go to holders and an issuer seizure is written down pro-rata for
+ *         index holders and credit holders alike.
  *
  *         FEES (index tokens to `feeRecipient`): a mint fee and a redeem fee, both owner-settable
  *         under a hard cap, plus a management fee accrued continuously as newly minted index tokens.
@@ -97,8 +98,18 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     address private immutable _deployer;
 
     mapping(address token => uint256) public held;
-    mapping(address account => mapping(address token => uint256)) public owed;
+
+    /// @dev Credits are kept as shares of one pool per token, so a seizure can be written down for
+    ///      every credit holder at once without looping over accounts. The pool's scale is
+    ///      totalOwed / totalOwedShares; one account's credit is its shares at that scale, rounded
+    ///      down, so the credits can never add up to more than `totalOwed`. If a seizure wipes a
+    ///      pool out completely, the token's epoch moves on: older shares are worth nothing and
+    ///      new credits start a fresh pool.
+    mapping(address account => mapping(address token => uint256)) internal _owedShares;
+    mapping(address account => mapping(address token => uint64)) internal _owedEpoch;
     mapping(address token => uint256) public totalOwed;
+    mapping(address token => uint256) public totalOwedShares;
+    mapping(address token => uint64) public owedEpoch;
 
     address public feeRecipient;
     address public rebalancer;
@@ -119,6 +130,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     event OwedClaimed(address indexed account, address indexed token, address to, uint256 amount);
     event ManagementFeeAccrued(uint256 shares, uint256 elapsed);
     event Synced(address indexed token, uint256 oldHeld, uint256 newHeld);
+    event CreditsWrittenDown(address indexed token, uint256 oldTotalOwed, uint256 newTotalOwed);
     event Traded(address indexed tokenIn, uint256 amountIn, address indexed tokenOut, uint256 amountOut);
     event FeesSet(uint16 redeemFeeBps, uint16 mgmtFeeBps);
     event MintFeeScheduleSet(MintFeeSchedule schedule);
@@ -318,8 +330,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
             address token = list[i];
             held[token] -= amt;
             if (!_tryTransfer(token, receiver, amt)) {
-                owed[creditTo][token] += amt;
-                totalOwed[token] += amt;
+                _credit(creditTo, token, amt);
                 emit LegCredited(creditTo, token, amt);
             }
         }
@@ -329,14 +340,37 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     /// @notice Collect a credited leg once the token can move again. Sends to `to`.
     function claimOwed(address token, address to) external nonReentrant returns (uint256 amount) {
         if (to == address(0)) revert ZeroAddress();
-        amount = owed[msg.sender][token];
+        amount = owed(msg.sender, token);
         if (amount == 0) revert NothingOwed();
         if (isBlocked(msg.sender, token)) revert Blocklisted(msg.sender, token);
         if (isBlocked(to, token)) revert Blocklisted(to, token);
-        owed[msg.sender][token] = 0;
+        totalOwedShares[token] -= _owedShares[msg.sender][token];
         totalOwed[token] -= amount;
+        _owedShares[msg.sender][token] = 0;
         IERC20(token).safeTransfer(to, amount);
         emit OwedClaimed(msg.sender, token, to, amount);
+    }
+
+    /// @notice What `account` can claim of `token` right now, after any seizure write-down.
+    function owed(address account, address token) public view returns (uint256) {
+        uint256 s = _owedShares[account][token];
+        if (s == 0 || _owedEpoch[account][token] != owedEpoch[token]) return 0;
+        return Math.mulDiv(s, totalOwed[token], totalOwedShares[token]);
+    }
+
+    /// @dev New credits buy pool shares at the current scale, rounded down, so they never dilute
+    ///      existing credit holders.
+    function _credit(address account, address token, uint256 amt) internal {
+        uint64 epoch = owedEpoch[token];
+        if (_owedEpoch[account][token] != epoch) {
+            _owedShares[account][token] = 0; // worthless shares from a wiped-out pool
+            _owedEpoch[account][token] = epoch;
+        }
+        uint256 supply = totalOwedShares[token];
+        uint256 shares = supply == 0 ? amt : Math.mulDiv(amt, supply, totalOwed[token]);
+        _owedShares[account][token] += shares;
+        totalOwedShares[token] = supply + shares;
+        totalOwed[token] += amt;
     }
 
     /* ------------------------------------------------------------------ */
@@ -401,14 +435,33 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         _accrue();
     }
 
-    /// @notice Re-read the real balance of a listed token: held = balance - credits.
-    ///         Donations go to holders; an issuer seizure is written down pro-rata. Permissionless.
+    /// @notice Re-read the real balance of a listed token. Permissionless.
+    ///         - Balance above the books (a donation): the surplus goes to index holders.
+    ///         - Balance below the books (an issuer seizure): the loss is shared pro-rata between
+    ///           index holders (`held`) and credit holders (`totalOwed`, which scales every
+    ///           account's credit at once). Both round down, so held + totalOwed <= balance.
     function sync(address token) external nonReentrant {
         if (!registry.isListed(token)) revert NotListed(token);
         uint256 bal = IERC20(token).balanceOf(address(this));
-        uint256 owedT = totalOwed[token];
-        uint256 newHeld = bal > owedT ? bal - owedT : 0;
-        emit Synced(token, held[token], newHeld);
+        uint256 h = held[token];
+        uint256 o = totalOwed[token];
+        uint256 newHeld;
+        if (bal >= h + o) {
+            newHeld = bal - o;
+        } else {
+            newHeld = Math.mulDiv(h, bal, h + o);
+            uint256 newOwed = Math.mulDiv(o, bal, h + o);
+            if (newOwed != o) {
+                totalOwed[token] = newOwed;
+                if (newOwed == 0) {
+                    // Nothing left to share: retire this pool's shares.
+                    totalOwedShares[token] = 0;
+                    ++owedEpoch[token];
+                }
+                emit CreditsWrittenDown(token, o, newOwed);
+            }
+        }
+        emit Synced(token, h, newHeld);
         held[token] = newHeld;
     }
 

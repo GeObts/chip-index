@@ -165,6 +165,48 @@ contract BasketRegistryTest is Fixture {
         assertFalse(registry.isListed(address(stocks[7])));
     }
 
+    /// A dropped token nobody holds any more but someone is still owed cannot be pruned, and a
+    /// basket change keeps it listed, so `sync` can still write those credits down.
+    function test_pruneRefusedWhileCreditsOutstanding() public {
+        // MSFT paused: the safe's redeem credits its MSFT leg instead of paying it.
+        stocks[7].setPaused(true);
+        uint256 safeShares = vault.balanceOf(safe);
+        vm.prank(safe);
+        vault.redeem(safeShares, safe);
+        uint256 feeShares = vault.balanceOf(address(splitter));
+        vm.prank(address(splitter));
+        vault.redeem(feeShares, address(splitter));
+        assertEq(vault.held(address(stocks[7])), 0);
+        uint256 owedMsft = vault.totalOwed(address(stocks[7]));
+        assertGt(owedMsft, 0);
+
+        BasketRegistry.AssetConfig[] memory cfg = new BasketRegistry.AssetConfig[](7);
+        BasketRegistry.AssetConfig[] memory full = _basket();
+        for (uint256 i; i < 7; ++i) {
+            cfg[i] = full[i];
+        }
+        cfg[0].weightBps = 2_500;
+        vm.prank(safe);
+        registry.queueBasket(cfg);
+        vm.warp(block.timestamp + 48 hours);
+        vm.prank(safe);
+        registry.executeBasket(cfg);
+        assertTrue(registry.isListed(address(stocks[7])), "kept listed: still owed");
+
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.StillOwed.selector, address(stocks[7]), owedMsft));
+        registry.prune(address(stocks[7]));
+
+        // Once every credit is claimed it can go.
+        stocks[7].setPaused(false);
+        vm.prank(safe);
+        vault.claimOwed(address(stocks[7]), safe);
+        vm.prank(address(splitter));
+        vault.claimOwed(address(stocks[7]), address(splitter));
+        assertEq(vault.totalOwed(address(stocks[7])), 0);
+        registry.prune(address(stocks[7]));
+        assertFalse(registry.isListed(address(stocks[7])));
+    }
+
     function test_staleFeed() public {
         vm.warp(block.timestamp + 26 hours + 1);
         for (uint256 i = 1; i < N; ++i) {

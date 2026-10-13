@@ -74,6 +74,11 @@ contract MockB20 is MockERC20 {
         policies.setBlocked(policy, a, b);
     }
 
+    /// @dev Issuer seizure: moves tokens out of `from` regardless of pause or blocklist.
+    function seize(address from, address to, uint256 amount) external {
+        super._update(from, to, amount);
+    }
+
     function setMultiplier(uint256 m) external {
         multiplier = m;
     }
@@ -168,6 +173,7 @@ contract MockSlipstreamRouter {
     address public immutable factory;
     mapping(address => uint256) public usdPrice;
     uint256 public skewBps;
+    uint256 public lastAmountOutMinimum; // what the last exactInput call asked for
 
     constructor(address factory_) {
         factory = factory_;
@@ -201,6 +207,7 @@ contract MockSlipstreamRouter {
 
     function exactInput(ISlipstreamRouter.ExactInputParams calldata p) external payable returns (uint256 out) {
         (address first, address last) = _ends(p.path);
+        lastAmountOutMinimum = p.amountOutMinimum;
         out = quoteOut(first, last, p.amountIn);
         require(out >= p.amountOutMinimum, "Too little received");
         _settle(first, p.amountIn, last, out, p.recipient);

@@ -88,21 +88,26 @@ contract IndexFeeSplitterTest is Fixture {
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(IndexFeeSplitter.OverBudget.selector, budget + 1, budget));
-        splitter.buyAndBurn(budget + 1, 0, deadline);
+        splitter.buyAndBurn(budget + 1, 1, deadline);
 
         vm.prank(safe);
         splitter.setMaxChipBuyUsdc(1e6);
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(IndexFeeSplitter.OverCap.selector, 2e6, 1e6));
-        splitter.buyAndBurn(2e6, 0, deadline);
+        splitter.buyAndBurn(2e6, 1, deadline);
 
         vm.prank(keeper);
         vm.expectRevert();
         splitter.buyAndBurn(1e6, type(uint256).max, deadline); // keeper's min CHIP out
 
+        // A zero floor is refused outright, whatever the keeper script does.
+        vm.prank(keeper);
+        vm.expectRevert(IndexFeeSplitter.ZeroMinChipOut.selector);
+        splitter.buyAndBurn(1e6, 0, deadline);
+
         vm.prank(alice);
         vm.expectRevert(IndexFeeSplitter.NotKeeper.selector);
-        splitter.buyAndBurn(1e6, 0, deadline);
+        splitter.buyAndBurn(1e6, 1, deadline);
     }
 
     function test_unlockCallbackOnlyPoolManager() public {

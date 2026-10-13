@@ -6,6 +6,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IndexVault} from "../../src/IndexVault.sol";
 import {Timelock} from "../../src/lib/Timelock.sol";
 import {Fixture} from "../Fixture.sol";
+import {MockB20} from "../mocks/Mocks.sol";
 
 contract IndexVaultTest is Fixture {
     /* ----------------------------- seed ----------------------------- */
@@ -317,6 +318,175 @@ contract IndexVaultTest is Fixture {
         stocks[0].transfer(address(0xdead), before / 2);
         vault.sync(address(stocks[0]));
         assertEq(vault.held(address(stocks[0])), before - before / 2);
+    }
+
+    /* ------------- seizure while credits are outstanding ------------- */
+
+    address internal carol = makeAddr("carol");
+
+    /// Stock 2 paused; alice is credited 30 tokens' worth and bob 20 tokens' worth of it.
+    function _creditAliceAndBob() internal returns (address t, uint256 aliceOwed, uint256 bobOwed) {
+        t = address(stocks[2]);
+        stocks[2].setPaused(true);
+        vm.startPrank(safe);
+        aliceOwed = vault.redeem(30e18, alice)[2];
+        bobOwed = vault.redeem(20e18, bob)[2];
+        vm.stopPrank();
+        assertEq(vault.owed(alice, t), aliceOwed);
+        assertEq(vault.owed(bob, t), bobOwed);
+        assertEq(vault.totalOwed(t), aliceOwed + bobOwed);
+    }
+
+    function _seize(address t, uint256 amount) internal {
+        MockB20(t).seize(address(vault), address(0xdead), amount);
+        vault.sync(t);
+    }
+
+    /// Books never promise more than the vault has, and no credit exceeds the pool.
+    function _assertSolvent(address t) internal view {
+        uint256 bal = MockB20(t).balanceOf(address(vault));
+        assertLe(vault.held(t) + vault.totalOwed(t), bal, "held + totalOwed <= balance");
+        uint256 sum = vault.owed(alice, t) + vault.owed(bob, t) + vault.owed(carol, t);
+        assertLe(sum, vault.totalOwed(t), "credits <= totalOwed");
+    }
+
+    /// Everyone claims and every index holder redeems in full: nothing reverts.
+    function _assertEveryoneGetsPaid(address t) internal {
+        stocks[2].setPaused(false);
+        address[3] memory who = [alice, bob, carol];
+        for (uint256 k; k < 3; ++k) {
+            if (vault.owed(who[k], t) == 0) continue;
+            vm.prank(who[k]);
+            vault.claimOwed(t, who[k]);
+        }
+        uint256 s = vault.balanceOf(safe);
+        if (s != 0) {
+            vm.prank(safe);
+            vault.redeem(s, safe);
+        }
+        uint256 f = vault.balanceOf(address(splitter));
+        if (f != 0) {
+            vm.prank(address(splitter));
+            vault.redeem(f, address(splitter));
+        }
+        assertEq(vault.totalSupply(), 0);
+    }
+
+    function test_seizure_smallerThanTotalOwed() public {
+        (address t, uint256 a, uint256 b) = _creditAliceAndBob();
+        uint256 h = vault.held(t);
+        uint256 o = a + b;
+        uint256 bal = h + o;
+        uint256 x = o / 2;
+        _seize(t, x);
+
+        // Loss shared pro-rata: held and credits shrink by the same fraction.
+        assertEq(vault.held(t), h * (bal - x) / bal);
+        assertEq(vault.totalOwed(t), o * (bal - x) / bal);
+        assertApproxEqAbs(vault.owed(alice, t), a * (bal - x) / bal, 1);
+        assertApproxEqAbs(vault.owed(bob, t), b * (bal - x) / bal, 1);
+        assertLt(vault.owed(alice, t), a, "credit written down");
+        _assertSolvent(t);
+        _assertEveryoneGetsPaid(t);
+    }
+
+    function test_seizure_largerThanTotalOwed() public {
+        (address t, uint256 a, uint256 b) = _creditAliceAndBob();
+        uint256 h = vault.held(t);
+        uint256 o = a + b;
+        uint256 bal = h + o;
+        uint256 x = o * 3 / 2; // more than every credit put together
+        assertLt(x, bal);
+        _seize(t, x);
+
+        // Before the fix the whole loss landed on index holders; now credits share it.
+        assertEq(vault.held(t), h * (bal - x) / bal);
+        assertEq(vault.totalOwed(t), o * (bal - x) / bal);
+        assertGt(vault.owed(alice, t), 0);
+        assertApproxEqAbs(vault.owed(bob, t), b * (bal - x) / bal, 1);
+        _assertSolvent(t);
+        _assertEveryoneGetsPaid(t);
+    }
+
+    function test_seizure_everything() public {
+        (address t,,) = _creditAliceAndBob();
+        uint64 epoch = vault.owedEpoch(t);
+        _seize(t, MockB20(t).balanceOf(address(vault)));
+
+        assertEq(vault.held(t), 0);
+        assertEq(vault.totalOwed(t), 0);
+        assertEq(vault.totalOwedShares(t), 0);
+        assertEq(vault.owedEpoch(t), epoch + 1, "old pool retired");
+        assertEq(vault.owed(alice, t), 0);
+        assertEq(vault.owed(bob, t), 0);
+        _assertSolvent(t);
+
+        stocks[2].setPaused(false);
+        vm.prank(alice);
+        vm.expectRevert(IndexVault.NothingOwed.selector);
+        vault.claimOwed(t, alice);
+        _assertEveryoneGetsPaid(t);
+    }
+
+    /// After a total wipe-out, new credits start a fresh pool at full value.
+    function test_seizure_everythingThenNewCredits() public {
+        (address t,,) = _creditAliceAndBob();
+        _seize(t, MockB20(t).balanceOf(address(vault)));
+        // The issuer restores some stock (re-mint); sync gives it to index holders.
+        MockB20(t).mint(address(vault), 50e8);
+        vault.sync(t);
+        assertEq(vault.held(t), 50e8);
+
+        vm.prank(safe);
+        uint256 fresh = vault.redeem(10e18, alice)[2]; // still paused: credited
+        assertGt(fresh, 0);
+        assertEq(vault.owed(alice, t), fresh, "only the new credit, at full value");
+        assertEq(vault.owed(bob, t), 0, "old wiped-out credit stays worthless");
+        assertEq(vault.totalOwed(t), fresh);
+        _assertSolvent(t);
+        _assertEveryoneGetsPaid(t);
+        assertEq(MockB20(t).balanceOf(alice), fresh);
+    }
+
+    /// Three seizures in a row, with a new credit (carol) between the first and second.
+    function test_seizure_multipleInARow() public {
+        (address t, uint256 a,) = _creditAliceAndBob();
+        _seize(t, vault.totalOwed(t) / 3);
+        uint256 aliceAfter1 = vault.owed(alice, t);
+        _assertSolvent(t);
+
+        vm.prank(safe);
+        uint256 c = vault.redeem(10e18, carol)[2];
+        assertApproxEqAbs(vault.owed(carol, t), c, 1, "new credit not diluted by the old write-down");
+        assertApproxEqAbs(vault.owed(alice, t), aliceAfter1, 1, "old credits not diluted by the new one");
+
+        uint256 aliceShare = vault.owed(alice, t) * 1e18 / vault.totalOwed(t);
+        _seize(t, MockB20(t).balanceOf(address(vault)) / 4);
+        _assertSolvent(t);
+        _seize(t, MockB20(t).balanceOf(address(vault)) / 10);
+        _assertSolvent(t);
+
+        // Every seizure scales all credits alike: alice keeps the same share of the pool.
+        assertLt(vault.owed(alice, t), a);
+        assertApproxEqRel(vault.owed(alice, t) * 1e18 / vault.totalOwed(t), aliceShare, 1e15);
+        _assertEveryoneGetsPaid(t);
+    }
+
+    /// Any sequence of up to three seizures, with a credit added in between, keeps the books
+    /// solvent and lets everyone be paid.
+    function testFuzz_seizuresKeepCreditsSolvent(uint256 s1, uint256 s2, uint256 s3, uint256 midShares) public {
+        (address t,,) = _creditAliceAndBob();
+        _seize(t, bound(s1, 0, MockB20(t).balanceOf(address(vault))));
+        _assertSolvent(t);
+        midShares = bound(midShares, 1, vault.balanceOf(safe));
+        vm.prank(safe);
+        vault.redeem(midShares, carol);
+        _assertSolvent(t);
+        _seize(t, bound(s2, 0, MockB20(t).balanceOf(address(vault))));
+        _assertSolvent(t);
+        _seize(t, bound(s3, 0, MockB20(t).balanceOf(address(vault))));
+        _assertSolvent(t);
+        _assertEveryoneGetsPaid(t);
     }
 
     function test_sync_onlyListed() public {

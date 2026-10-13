@@ -127,6 +127,77 @@ contract MintFeeTiersTest is Fixture {
         assertGt(vault.totalSupply(), supplyBefore);
     }
 
+    /* ------------------- review checks: can a tier be gamed? ------------------- */
+
+    /// USD value of `who`'s index tokens at NAV.
+    function _positionUsd(address who) internal view returns (uint256) {
+        return Math.mulDiv(vault.balanceOf(who), vault.navUsd(), vault.totalSupply() + vault.pendingManagementFee());
+    }
+
+    /// USD value of what a mint of `shares` takes from the minter right now.
+    function _depositUsd(uint256 shares) internal view returns (uint256 usd) {
+        (address[] memory list, uint256[] memory amounts) = vault.previewMint(shares);
+        for (uint256 i; i < N; ++i) {
+            usd += registry.valueUsd(list[i], amounts[i]);
+        }
+    }
+
+    /// Check 2: donating stock and calling sync to push a $49k mint into the 0.5% tier. The donation
+    /// raises the price of the attacker's own new shares too, so all of it goes to existing holders:
+    /// measured, the attacker loses the whole ~$2,062 donation to save ~$117.50 in fees.
+    function test_donationToReachTier_costsMoreThanItSaves() public {
+        _mintAs(bob, _sharesFor(100_000e18)); // other holders: ~$101k of NAV in the vault
+        uint256 snap = vm.snapshotState();
+
+        // A. Honest: mint $50,000 straight away at 0.5%.
+        uint256 sA = _sharesFor(50_000e18);
+        uint256 spentA = _depositUsd(sA);
+        _mintExpect(sA, 50);
+        uint256 lossA = spentA - _positionUsd(alice);
+        vm.revertToState(snap);
+
+        // B. Attack: shares worth $49,000, plus a donation big enough to price them at $50,000.
+        uint256 sB = _sharesFor(49_000e18);
+        uint256 supply = vault.totalSupply() + vault.pendingManagementFee();
+        uint256 donateUsd = Math.mulDiv(50_000e18, supply, sB, Math.Rounding.Ceil) - vault.navUsd() + 1e18;
+        uint256 donated = registry.amountForUsd(address(stocks[0]), donateUsd);
+        stocks[0].mint(address(vault), donated);
+        vault.sync(address(stocks[0]));
+        (uint16 bps,) = vault.mintFeeFor(sB);
+        assertEq(bps, 50, "the donation did reach the 0.5% tier");
+        uint256 spentB = registry.valueUsd(address(stocks[0]), donated) + _depositUsd(sB);
+        _mintAs(alice, sB);
+        uint256 lossB = spentB - _positionUsd(alice);
+
+        emit log_named_decimal_uint("honest $50k mint: alice loses (USD)", lossA, 18);
+        emit log_named_decimal_uint("donation attack: donated (USD)", donateUsd, 18);
+        emit log_named_decimal_uint("donation attack: alice loses (USD)", lossB, 18);
+        assertGt(lossB, lossA + 900e18, "the attack loses at least $900 more than minting honestly");
+    }
+
+    /// Check 1: the feed price never changes WHAT a mint costs (pro-rata, no oracle), only which
+    /// fee tier it lands in. A feed 0.5% off (Chainlink's deviation threshold) moves the tier
+    /// boundary by at most 0.5%: at worst a mint truly worth $49,751 pays 0.5% instead of 0.75%.
+    function test_stalePriceOnlyMovesTheTierBoundary() public {
+        uint256 s = _sharesFor(49_800e18);
+        (, uint256[] memory before) = vault.previewMint(s);
+        (uint16 bpsTrue,) = vault.mintFeeFor(s);
+        assertEq(bpsTrue, 75);
+
+        // Every feed reads 0.5% high (the market fell, the feed has not updated yet).
+        for (uint256 i; i < N; ++i) {
+            feeds[i].set(prices8[i] * 1005 / 1000);
+        }
+        (, uint256[] memory afterMove) = vault.previewMint(s);
+        for (uint256 i; i < N; ++i) {
+            assertEq(afterMove[i], before[i], "same stock in, same shares out");
+        }
+        (uint16 bpsStale, uint256 v) = vault.mintFeeFor(s);
+        assertEq(bpsStale, 50, "tier boundary moved by the 0.5% feed error");
+        assertGe(v, 50_000e18);
+        // Fee saved: 0.25% of ~$49.8k, about $125. No share mispricing, so nothing else to win.
+    }
+
     /* --------------------------- redeem unchanged --------------------------- */
 
     function test_redeemFeeStays1pctAtAnySize() public {

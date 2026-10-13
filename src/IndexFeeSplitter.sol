@@ -28,7 +28,7 @@ import {OracleLib} from "./lib/OracleLib.sol";
  *         (USDC -> WETH on Aerodrome, WETH -> $CHIP on the Uniswap v4 pool) and burns it.
  *
  *         $CHIP has no onchain TWAP (its v4 hook keeps no oracle), so the $CHIP leg is protected
- *         by the keeper's `minChipOut` plus a per-call size cap (`maxChipBuyUsdc`).
+ *         by the keeper's `minChipOut` (which may not be 0) plus a per-call size cap (`maxChipBuyUsdc`).
  */
 contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     using SafeERC20 for IERC20;
@@ -105,6 +105,7 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     error OverBudget(uint256 usdcIn, uint256 budget);
     error OverCap(uint256 usdcIn, uint256 cap);
     error ChipOutBelowMin(uint256 out, uint256 min);
+    error ZeroMinChipOut();
     error PartialFill(uint256 paid, uint256 wanted);
     error SlippageAboveCap(uint16 bps);
     error NoSuchPool(int24 tickSpacing);
@@ -211,6 +212,8 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         nonReentrant
         returns (uint256 chipOut)
     {
+        // No onchain price for $CHIP: the keeper must send a floor from a live quote, never 0.
+        if (minChipOut == 0) revert ZeroMinChipOut();
         if (usdcIn > chipBudget) revert OverBudget(usdcIn, chipBudget);
         if (usdcIn > maxChipBuyUsdc) revert OverCap(usdcIn, maxChipBuyUsdc);
         chipBudget -= usdcIn;

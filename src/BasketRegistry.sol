@@ -12,6 +12,7 @@ import {Timelock} from "./lib/Timelock.sol";
 
 interface IHoldings {
     function held(address token) external view returns (uint256);
+    function totalOwed(address token) external view returns (uint256);
 }
 
 /**
@@ -21,9 +22,9 @@ interface IHoldings {
  *         - The launch basket is set in the constructor. Every later change (add, remove,
  *           re-weight, change a feed) goes through ONE timelocked call: queue a whole new
  *           basket, wait 48h, execute within 14 days.
- *         - A token dropped from the basket while the vault still holds it stays listed at
- *           weight 0, so holders can always redeem it. The Rebalancer sells it down and anyone
- *           can then `prune` it once the vault holds none.
+ *         - A token dropped from the basket while the vault still holds it, or still owes credits
+ *           in it, stays listed at weight 0, so holders can always redeem it. The Rebalancer
+ *           sells it down and anyone can then `prune` it once the vault holds and owes none.
  *         - Prices: value = raw token balance x feed price. The Coinbase feeds are total-return,
  *           so they already include the B20 dividend multiplier.
  */
@@ -79,6 +80,7 @@ contract BasketRegistry is Ownable2Step, Timelock {
     error NotListed(address token);
     error StillTargeted(address token);
     error StillHeld(address token, uint256 held);
+    error StillOwed(address token, uint256 totalOwed);
     error FeedAgeOutOfBounds(uint256 maxFeedAge);
     error NoSuchPool(address token, int24 tickSpacing);
     error NotDeployer();
@@ -131,12 +133,12 @@ contract BasketRegistry is Ownable2Step, Timelock {
         // Re-validated at execute: decimals or feeds could in principle have changed.
         _validate(config);
 
-        // Carry over anything the vault still holds that the new basket drops, at weight 0.
+        // Carry over anything the vault still holds (or owes) that the new basket drops, at weight 0.
         Asset[] memory old = _assets;
         _clear();
         _install(config);
         for (uint256 i; i < old.length; ++i) {
-            if (_indexPlusOne[old[i].token] == 0 && _held(old[i].token) > 0) {
+            if (_indexPlusOne[old[i].token] == 0 && (_held(old[i].token) > 0 || _owed(old[i].token) > 0)) {
                 old[i].weightBps = 0;
                 _push(old[i]);
             }
@@ -149,13 +151,16 @@ contract BasketRegistry is Ownable2Step, Timelock {
         _cancel(id);
     }
 
-    /// @notice Drop a weight-0 token the vault no longer holds. Permissionless.
+    /// @notice Drop a weight-0 token the vault no longer holds and owes no one. Permissionless.
+    ///         Outstanding credits keep it listed so sync can still write them down.
     function prune(address token) external {
         uint256 ip1 = _indexPlusOne[token];
         if (ip1 == 0) revert NotListed(token);
         if (_assets[ip1 - 1].weightBps != 0) revert StillTargeted(token);
         uint256 h = _held(token);
         if (h != 0) revert StillHeld(token, h);
+        uint256 o = _owed(token);
+        if (o != 0) revert StillOwed(token, o);
         uint256 last = _assets.length - 1;
         if (ip1 - 1 != last) {
             Asset memory moved = _assets[last];
@@ -261,6 +266,10 @@ contract BasketRegistry is Ownable2Step, Timelock {
 
     function _held(address token) internal view returns (uint256) {
         return vault == address(0) ? 0 : IHoldings(vault).held(token);
+    }
+
+    function _owed(address token) internal view returns (uint256) {
+        return vault == address(0) ? 0 : IHoldings(vault).totalOwed(token);
     }
 
     function _validate(AssetConfig[] memory config) internal view {
