@@ -87,6 +87,17 @@ abstract contract ChipIndexForkBase is Test {
     Rebalancer internal rebalancer;
     IndexFeeSplitter internal splitter;
 
+    /// 1% under $10k, 0.75% from $10k, 0.5% from $50k (same as script/Deploy.s.sol LaunchConfig).
+    function _launchMintFees() internal pure returns (IndexVault.MintFeeSchedule memory) {
+        return IndexVault.MintFeeSchedule({
+            tier1MinUsd: 10_000e18,
+            tier2MinUsd: 50_000e18,
+            baseBps: 100,
+            tier1Bps: 75,
+            tier2Bps: 50
+        });
+    }
+
     function setUp() public {
         vm.createSelectFork(vm.envString("BASE_RPC_URL"));
         assertEq(alice.code.length + bob.code.length, 0, "test wallets must have no code on Base");
@@ -99,7 +110,7 @@ abstract contract ChipIndexForkBase is Test {
             ts[i] = STOCK_TS;
         }
         registry = new BasketRegistry(SAFE, SEQUENCER_FEED, SLIP_FACTORY, USDC, cfg, ts);
-        vault = new IndexVault(SAFE, registry, POLICY_REGISTRY, "Chip Index", "CHIPX", 100, 100, 300, 1_000_000e18);
+        vault = new IndexVault(SAFE, registry, POLICY_REGISTRY, "Chip Index", "CHIPX", _launchMintFees(), 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(SAFE, vault, ISlipstreamRouter(SLIP_ROUTER), USDC, KEEPER);
         router = new IndexRouter(
             SAFE, vault, ISlipstreamRouter(SLIP_ROUTER), USDC, WETH, ETH_USD_FEED, WETH_USDC_TS, KEEPER

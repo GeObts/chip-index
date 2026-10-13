@@ -53,13 +53,19 @@ interface IRebalanceCallback {
  *
  *         FEES (index tokens to `feeRecipient`): a mint fee and a redeem fee, both owner-settable
  *         under a hard cap, plus a management fee accrued continuously as newly minted index tokens.
+ *         The mint fee is size-tiered: the dollar value of one mint, priced at NAV from the
+ *         Chainlink feeds, picks one of three rates (launch: 1% under $10k, 0.75% from $10k,
+ *         0.5% from $50k). It applies to every mint path, because USDC and ETH mints reach the
+ *         vault through the router as an in-kind `mint`. If any feed is stale the mint still
+ *         goes through, at the base (highest) rate: no fresh price, no discount. The schedule
+ *         changes only through the 48h timelock, and no rate may exceed MAX_MINT_FEE_BPS (1%).
  */
 contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     using SafeERC20 for IERC20;
 
     uint256 public constant BPS = 10_000;
     uint256 public constant YEAR = 365 days;
-    uint256 public constant MAX_MINT_FEE_BPS = 200; // 2%
+    uint256 public constant MAX_MINT_FEE_BPS = 100; // 1%, every tier
     uint256 public constant MAX_REDEEM_FEE_BPS = 200; // 2%
     uint256 public constant MAX_MGMT_FEE_BPS = 500; // 5% a year
     uint256 public constant MAX_TRADE_SLIPPAGE_BPS = 200; // rebalance hard cap
@@ -69,9 +75,21 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
 
     bytes32 public constant ACTION_REBALANCER = keccak256("REBALANCER");
     bytes32 public constant ACTION_FEE_RECIPIENT = keccak256("FEE_RECIPIENT");
+    bytes32 public constant ACTION_MINT_FEE_SCHEDULE = keccak256("MINT_FEE_SCHEDULE");
     bytes32 public constant TRANSFER_SENDER_POLICY = keccak256("TRANSFER_SENDER_POLICY");
     bytes32 public constant TRANSFER_RECEIVER_POLICY = keccak256("TRANSFER_RECEIVER_POLICY");
     bytes32 public constant TRANSFER_EXECUTOR_POLICY = keccak256("TRANSFER_EXECUTOR_POLICY");
+
+    /// @notice Size-tiered mint fee. Thresholds are USD with 18 decimals and compare against the
+    ///         NAV value of the gross shares minted: value < tier1MinUsd pays baseBps, value >=
+    ///         tier1MinUsd pays tier1Bps, value >= tier2MinUsd pays tier2Bps.
+    struct MintFeeSchedule {
+        uint128 tier1MinUsd;
+        uint128 tier2MinUsd;
+        uint16 baseBps;
+        uint16 tier1Bps;
+        uint16 tier2Bps;
+    }
 
     BasketRegistry public immutable registry;
     /// @notice Base's PolicyRegistry precompile (0x8453...0002 on mainnet).
@@ -84,7 +102,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
 
     address public feeRecipient;
     address public rebalancer;
-    uint16 public mintFeeBps;
+    MintFeeSchedule internal _mintFees;
     uint16 public redeemFeeBps;
     uint16 public mgmtFeeBps;
     uint16 public maxTradeSlippageBps = 100;
@@ -102,7 +120,8 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     event ManagementFeeAccrued(uint256 shares, uint256 elapsed);
     event Synced(address indexed token, uint256 oldHeld, uint256 newHeld);
     event Traded(address indexed tokenIn, uint256 amountIn, address indexed tokenOut, uint256 amountOut);
-    event FeesSet(uint16 mintFeeBps, uint16 redeemFeeBps, uint16 mgmtFeeBps);
+    event FeesSet(uint16 redeemFeeBps, uint16 mgmtFeeBps);
+    event MintFeeScheduleSet(MintFeeSchedule schedule);
     event MintCapSet(uint256 mintCap);
     event MintPausedSet(bool paused);
     event MaxTradeSlippageSet(uint16 bps);
@@ -116,6 +135,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     error AlreadySeeded();
     error MintCapExceeded(uint256 supplyAfter, uint256 cap);
     error FeeAboveCap(uint256 fee, uint256 cap);
+    error BadTierThresholds(uint256 tier1MinUsd, uint256 tier2MinUsd);
     error LengthMismatch();
     error NothingHeld();
     error ShortDelivery(address token, uint256 expected, uint256 received);
@@ -137,7 +157,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         address policyRegistry_,
         string memory name_,
         string memory symbol_,
-        uint16 mintFeeBps_,
+        MintFeeSchedule memory mintFees_,
         uint16 redeemFeeBps_,
         uint16 mgmtFeeBps_,
         uint256 mintCap_
@@ -146,7 +166,8 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         registry = registry_;
         policyRegistry = IPolicyRegistryView(policyRegistry_);
         _deployer = msg.sender;
-        _setFees(mintFeeBps_, redeemFeeBps_, mgmtFeeBps_);
+        _setMintFees(mintFees_);
+        _setFees(redeemFeeBps_, mgmtFeeBps_);
         mintCap = mintCap_;
         lastAccrual = uint64(block.timestamp);
     }
@@ -209,6 +230,9 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         if (totalSupply() == 0) revert NotSeeded();
         _accrue();
 
+        // Priced before the deposit lands, against the same supply previewMint uses.
+        (uint16 feeBps,) = mintFeeFor(shares);
+
         address[] memory list;
         (list, amounts) = previewMint(shares);
         for (uint256 i; i < list.length; ++i) {
@@ -217,11 +241,31 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
             held[list[i]] += amounts[i];
         }
 
-        uint256 fee = shares * mintFeeBps / BPS;
+        uint256 fee = shares * feeBps / BPS;
         _mint(to, shares - fee);
         if (fee != 0) _mint(feeRecipient, fee);
         if (totalSupply() > mintCap) revert MintCapExceeded(totalSupply(), mintCap);
         emit Minted(msg.sender, to, shares, fee, amounts);
+    }
+
+    /// @notice The mint fee rate for minting `shares` now, and the NAV value it was priced at.
+    ///         `valueUsd` is 0 when a feed is stale (or before the seed); the base rate applies.
+    function mintFeeFor(uint256 shares) public view returns (uint16 feeBps, uint256 valueUsd) {
+        MintFeeSchedule memory s = _mintFees;
+        uint256 supply = totalSupply() + pendingManagementFee();
+        if (supply == 0) return (s.baseBps, 0);
+        try this.navUsd() returns (uint256 nav) {
+            valueUsd = Math.mulDiv(nav, shares, supply);
+        } catch {
+            return (s.baseBps, 0);
+        }
+        if (valueUsd >= s.tier2MinUsd) return (s.tier2Bps, valueUsd);
+        if (valueUsd >= s.tier1MinUsd) return (s.tier1Bps, valueUsd);
+        return (s.baseBps, valueUsd);
+    }
+
+    function mintFeeSchedule() external view returns (MintFeeSchedule memory) {
+        return _mintFees;
     }
 
     /* ------------------------------------------------------------------ */
@@ -436,9 +480,22 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     /*                         Owner settings                              */
     /* ------------------------------------------------------------------ */
 
-    function setFees(uint16 mintFeeBps_, uint16 redeemFeeBps_, uint16 mgmtFeeBps_) external onlyOwner {
+    /// @notice Redeem and management fees. Immediate, not timelocked. The mint fee schedule is
+    ///         separate and timelocked: queueMintFeeSchedule / executeMintFeeSchedule.
+    function setFees(uint16 redeemFeeBps_, uint16 mgmtFeeBps_) external onlyOwner {
         _accrue(); // the old management rate applies up to now
-        _setFees(mintFeeBps_, redeemFeeBps_, mgmtFeeBps_);
+        _setFees(redeemFeeBps_, mgmtFeeBps_);
+    }
+
+    /// @notice Queue a new mint fee schedule (48h timelock). Checked now and again on execute.
+    function queueMintFeeSchedule(MintFeeSchedule calldata s) external onlyOwner returns (bytes32) {
+        _checkMintFees(s);
+        return _queue(ACTION_MINT_FEE_SCHEDULE, abi.encode(s));
+    }
+
+    function executeMintFeeSchedule(MintFeeSchedule calldata s) external onlyOwner {
+        _consume(ACTION_MINT_FEE_SCHEDULE, abi.encode(s));
+        _setMintFees(s);
     }
 
     function setMintCap(uint256 mintCap_) external onlyOwner {
@@ -498,14 +555,29 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         }
     }
 
-    function _setFees(uint16 m, uint16 r, uint16 g) internal {
-        if (m > MAX_MINT_FEE_BPS) revert FeeAboveCap(m, MAX_MINT_FEE_BPS);
+    function _setFees(uint16 r, uint16 g) internal {
         if (r > MAX_REDEEM_FEE_BPS) revert FeeAboveCap(r, MAX_REDEEM_FEE_BPS);
         if (g > MAX_MGMT_FEE_BPS) revert FeeAboveCap(g, MAX_MGMT_FEE_BPS);
-        mintFeeBps = m;
         redeemFeeBps = r;
         mgmtFeeBps = g;
-        emit FeesSet(m, r, g);
+        emit FeesSet(r, g);
+    }
+
+    /// @dev Rates are uint16, so none can go below 0%. Thresholds must be above zero and strictly
+    ///      increasing, so the three bands always exist and in order.
+    function _checkMintFees(MintFeeSchedule memory s) internal pure {
+        if (s.baseBps > MAX_MINT_FEE_BPS) revert FeeAboveCap(s.baseBps, MAX_MINT_FEE_BPS);
+        if (s.tier1Bps > MAX_MINT_FEE_BPS) revert FeeAboveCap(s.tier1Bps, MAX_MINT_FEE_BPS);
+        if (s.tier2Bps > MAX_MINT_FEE_BPS) revert FeeAboveCap(s.tier2Bps, MAX_MINT_FEE_BPS);
+        if (s.tier1MinUsd == 0 || s.tier2MinUsd <= s.tier1MinUsd) {
+            revert BadTierThresholds(s.tier1MinUsd, s.tier2MinUsd);
+        }
+    }
+
+    function _setMintFees(MintFeeSchedule memory s) internal {
+        _checkMintFees(s);
+        _mintFees = s;
+        emit MintFeeScheduleSet(s);
     }
 
     /// @dev Pull and check the vault received exactly `amount` (B20s take no transfer fee; this

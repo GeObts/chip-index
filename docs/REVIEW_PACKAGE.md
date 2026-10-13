@@ -1,8 +1,8 @@
 # Chip Index — independent review package
 
 **Status:** pre-deployment. Nothing is deployed. All results below come from local tests and a
-Base mainnet fork (2026-10-12).
-**Scope:** `src/` (1,985 lines across 11 files). Out of scope: tests, scripts, and the existing
+Base mainnet fork (2026-10-12, size-tiered mint fee added 2026-10-13).
+**Scope:** `src/` (2,089 lines across 11 files). Out of scope: tests, scripts, and the existing
 Chipworks contracts (Pot, ChipBurner, $CHIP), which are integrated as external dependencies.
 **Toolchain:** solc 0.8.24, `evm_version = cancun`, optimizer 200 runs, no via-IR,
 OpenZeppelin v5.1.0, base-std @ `6a249339`. Fork tests use base-forge (base-anvil v1.1.0).
@@ -17,7 +17,7 @@ of the stocks. Fees go 50% to the Chipworks Pot as USDC and 50% to buy-and-burn 
 
 | Contract | Lines | Runtime size | What it does |
 |---|---|---|---|
-| `IndexVault` | 528 | 18.2 KB | The index token. Pro-rata in-kind mint (rounds up) and redeem (rounds down) with **no oracle**; redeem has **no pause**. Undeliverable legs (issuer pause, vault blocklisted) become claimable credits. Refuses redeem/claim for issuer-blocklisted caller, receiver or credit holder. Mint cap (global), mint pause. Fees: mint/redeem (cap 2%), management (cap 5%/yr, per-second accrual as minted shares). Executes rebalance trades for the Rebalancer and itself enforces Chainlink value-in vs value-out (max 1%, cap 2%). Rebalancer and fee-recipient changes: 48h timelock. |
+| `IndexVault` | 600 | 19.7 KB | The index token. Pro-rata in-kind mint (rounds up) and redeem (rounds down). The basket ratio never depends on an oracle; mint reads Chainlink only to pick its fee rate, and still works at the base rate when a feed is stale. Redeem has **no pause** and **no oracle**. Undeliverable legs (issuer pause, vault blocklisted) become claimable credits. Refuses redeem/claim for issuer-blocklisted caller, receiver or credit holder. Mint cap (global), mint pause. Fees: **size-tiered mint fee** (see below; every rate capped at 1%), redeem (cap 2%), management (cap 5%/yr, per-second accrual as minted shares). Executes rebalance trades for the Rebalancer and itself enforces Chainlink value-in vs value-out (max 1%, cap 2%). Rebalancer, fee-recipient and mint-fee-schedule changes: 48h timelock. |
 | `BasketRegistry` | 319 | 10.4 KB | Tokens, feeds and target weights. Launch basket set in the constructor; any later change replaces the whole basket through a 48h timelock with a 14-day grace window. Dropped tokens still held stay listed at weight 0 until `prune`. Chainlink reads: positive answer, `maxFeedAge` (26h default, 1h–72h), Base sequencer uptime with 1h grace. |
 | `IndexRouter` | 400 | 15.0 KB | Cash mint (exact-output swaps USDC/ETH→each stock on Aerodrome Slipstream) and cash redeem (exact-input stock→USDC/ETH). User limit plus each leg within 1% of Chainlink. Mint and redeem both require all feeds fresh. Owner or keeper can pause either path; only the owner unpauses. Checks the cash recipient against the blocklist. ETH refunds/payouts forward all gas and fall back to WETH if the recipient rejects ETH, so a contract wallet can never block its own mint or redeem. Holds no balance between calls. |
 | `Rebalancer` | 173 | 6.1 KB | Keeper-only. Allowed when any weight drifts more than 3 points from target, or 30 days after the last rebalance. Each trade must sell an overweight and buy an underweight stock, and total absolute drift must fall. Routes stock→USDC→stock on Aerodrome via the vault's callback. |
@@ -27,6 +27,32 @@ of the stocks. Fees go 50% to the Chipworks Pot as USDC and 50% to buy-and-burn 
 Every contract is `Ownable2Step`, owned by the Chipworks Safe `0xe1096B72…73C7` from the
 constructor. One-time wiring (`wireVault`, `wire`) is callable only by the deploying address and
 only once. The keeper is `0x6571E341…95B9`.
+
+### Size-tiered mint fee (added 2026-10-13)
+
+The mint fee depends on the dollar size of one mint. The vault prices the gross shares at NAV
+(`navUsd() × shares / supply`, Chainlink, all feeds fresh) **before** the deposit lands, and picks:
+
+| Value of one mint | Launch rate |
+|---|---|
+| under $10,000 | 1% (`baseBps` 100) |
+| $10,000 to $49,999.99 | 0.75% (`tier1Bps` 75) |
+| $50,000 and up | 0.5% (`tier2Bps` 50) |
+
+- One rule for every mint path: USDC and ETH mints reach the vault through the router as an in-kind
+  `mint`, so the vault charges them the same way. The tier is per call, not cumulative.
+- **Stale feed or sequencer down:** `mintFeeFor` catches the revert (`try this.navUsd()`) and charges
+  the base rate. In-kind mint keeps working without prices, it just gets no discount.
+- **Owner-settable, timelocked:** `queueMintFeeSchedule` / `executeMintFeeSchedule` through the same
+  48h timelock (14-day grace) as the rebalancer and fee recipient. Hard caps checked on queue and on
+  execute: every rate ≤ `MAX_MINT_FEE_BPS` = 100 (1%); rates are `uint16`, so none can go below 0%;
+  thresholds must be > 0 and strictly increasing. The constructor applies the same checks.
+- The mint fee was removed from `setFees`, which now sets only redeem and management. **Those two are
+  still immediate (not timelocked)**, as before. The 2% mint cap from SPEC v0 is now 1%.
+- Redeem fee is unchanged: 1% at any size.
+- Launch values live in `LaunchConfig` (`script/Deploy.s.sol`); `verify` checks the deployed schedule.
+- At the launch mint cap (2,500 tokens = $25k in total) the $50k tier cannot be reached until the Safe
+  raises the cap.
 
 ## 3. Design invariants to check
 1. In-kind redeem can never be blocked by the owner, the keeper, oracles or the sequencer. It is
@@ -62,27 +88,28 @@ redeem/claim checks on their own terms, not as a complete compliance barrier.
 - 1 USDC = $1 in the Router.
 - $CHIP has no onchain TWAP (its Doppler hook keeps no oracle). Buys rely on the keeper's
   `minChipOut` and the $100 per-call cap.
-- Owner powers: fee rates under hard caps, mint cap, mint pause, feed max age (1h–72h),
-  pool tick spacing (validated against the factory), keeper address, cash-path pause/unpause;
-  timelocked: basket, rebalancer, fee recipient. The owner cannot pause in-kind redeem or take
+- Owner powers: redeem and management fee under hard caps (immediate), mint cap, mint pause, feed
+  max age (1h–72h), pool tick spacing (validated against the factory), keeper address, cash-path
+  pause/unpause; timelocked: basket, rebalancer, fee recipient, mint fee schedule. The owner cannot pause in-kind redeem or take
   vault assets.
 - Keeper powers: rebalance (within rules and vault slippage), sell fee stocks (Chainlink floor),
   buy and burn $CHIP (budget and cap), pause cash paths.
 
-## 6. Test results (2026-10-12)
+## 6. Test results (2026-10-12, re-run 2026-10-13)
 
-**Unit + invariant (mocks): 88 passed, 0 failed.** `forge test --no-match-path "test/fork/*"`
+**Unit + invariant (mocks): 105 passed, 0 failed.** `forge test --no-match-path "test/fork/*"`
 
 | Suite | Tests | Covers |
 |---|---|---|
 | IndexVault | 32 | seed, pro-rata mint/redeem, fees and caps, management accrual, credits, pause, vault-blocklisted stock, **blocklist (5)**, sync, timelocks, 2 fuzz tests (512 runs) |
+| MintFeeTiers | 17 | just under / at / just over $10k and $50k (±$0.01), small mint, per-mint (not cumulative), USDC and ETH router mints get the tier, stale feed → mint works at 1%, redeem stays 1% at $60k, timelock (early, mismatched data, owner-only), caps (101 bps rejected on each rate, bad thresholds, constructor) |
 | IndexRouter | 19 | USDC/ETH mint and redeem, 1% leg bound, user limits, stale feeds, pause roles, credits go to the user, **blocklist (2)**, ETH-rejecting wallet gets WETH (2) |
 | BasketRegistry | 15 | launch basket, validation, timelock delay/grace/mismatch/cancel, add/remove/prune, stale/bad/broken feeds, sequencer |
 | Rebalancer | 11 | eligibility (drift / 30 days), over/underweight rules, overshoot, vault slippage, keeper minOut, removed ticker |
 | IndexFeeSplitter | 8 | fee-free redeem, 50/50 split, oracle floor, buy-and-burn, caps, sweep limits |
 | Invariants | 3 | §3 items 3 and 4, plus full redeem always succeeds: 64×100 calls by default, 512×500 in the `deep` profile (passed at 256,000 calls) |
 
-**Base mainnet fork (real B20s, feeds, Aerodrome, $CHIP v4 pool, ChipBurner): 30 passed, 0 failed.**
+**Base mainnet fork (real B20s, feeds, Aerodrome, $CHIP v4 pool, ChipBurner): 34 passed, 0 failed.**
 `./script/fork-test.sh` (base-forge)
 
 | Test | Result |
@@ -100,6 +127,7 @@ redeem/claim checks on their own terms, not as a complete compliance barrier.
 | Rebalance | drift 4.95 → 4.01 points; NAV 1,060.00 → 1,059.95 |
 | Fee pipeline (1 year) | 3% minted; $14.55 to Pot; ~20.2M $CHIP bought and burned; supply fell by exactly that |
 | Small cash mints (4) | see table below; unspent ETH refunded |
+| Tiered mints (4) | $10k and $50k with USDC and with ETH: 0.75% and 0.5% charged exactly; every stock leg within the 1% limit (table below) |
 | Contract wallets (6) | real Coinbase Smart Wallet v1.1 and Safe v1.4.1 created with the official Base factories: ETH and USDC mint + redeem, in-kind redeem; refunds arrive as ETH; an ETH-rejecting contract gets WETH (see below) |
 
 Small cash mints, with gas at 0.006 gwei (live 2026-10-12):
@@ -110,6 +138,30 @@ Small cash mints, with gas at 0.006 gwei (live 2026-10-12):
 | $5 USDC | 5.004 USDC | 0.495 | 0.005 tokens ($0.05) | 2.41M | $0.036 |
 | $20 ETH | 0.008071 ETH ($20.01) | 1.98 | 0.02 tokens ($0.20) | 3.01M | $0.045 |
 | $5 ETH | 0.002018 ETH ($5.00) | 0.495 | 0.005 tokens ($0.05) | 3.01M | $0.045 |
+
+Tiered cash mints (fork 2026-10-13, test vault with a 1,000,000-token cap; the launch cap is not
+changed). "Leg cost" is what each stock cost versus its Chainlink value, pool fee included. That is
+the number the router holds to 1% per leg (`MAX_LEG_SLIPPAGE_BPS`). Negative means it filled better
+than Chainlink.
+
+| Stock | USDC $10k | USDC $50k | ETH $10k | ETH $50k |
+|---|---|---|---|---|
+| NVDA | 0.11% | 0.11% | 0.21% | 0.21% |
+| MSTR | −0.26% | −0.25% | −0.17% | −0.15% |
+| GOOGL | 0.40% | 0.41% | 0.50% | 0.51% |
+| AMZN | 0.12% | 0.13% | 0.21% | 0.23% |
+| AAPL | 0.47% | 0.47% | 0.57% | 0.58% |
+| META | 0.14% | 0.15% | 0.24% | 0.25% |
+| TSLA | −0.04% | −0.03% | 0.05% | 0.07% |
+| MSFT | 0.37% | 0.39% | 0.47% | 0.50% |
+| **Worst leg** | 0.47% | 0.47% | 0.56% | 0.58% |
+| Paid | 10,016 USDC | 50,086 USDC | $10,026 of ETH | $50,136 of ETH |
+| Mint fee | 0.75% ($75) | 0.5% ($250) | 0.75% ($75) | 0.5% ($250) |
+
+None came within 0.4 points of the 1% limit. Going from $1,250 to $6,250 per leg moved the cost by
+at most 0.03 points, so at these sizes the cost is mostly the pool fee, not price impact. The ETH
+route costs about 0.1 point more because it also crosses the WETH/USDC pool. Source:
+`test/fork/MintTierFork.t.sol`, run with `-vv`.
 
 **Measured on the fork:**
 - Nothing blocks small cash mints; a $0.01 USDC mint also worked in a one-off probe. Gas does not
@@ -143,7 +195,11 @@ weekends.
    behave correctly with the Doppler hook's dynamic fee?
 5. Management fee as per-second minted shares: rounding or accrual-ordering issues around `setFees`
    and `executeFeeRecipient`?
-6. `IndexRouter._sendEth` forwards all gas and falls back to WETH on failure. The recipient is always
+6. Tiered mint fee: `mintFeeFor` prices the mint with `try this.navUsd()` (an external self-call)
+   and falls back to the base rate on any revert. Can a minter push the priced value across a
+   threshold cheaply (for example by donating to the vault and calling `sync` first), and is the
+   fallback sound? (Starving the inner call of gas only makes the minter pay the higher rate.)
+7. `IndexRouter._sendEth` forwards all gas and falls back to WETH on failure. The recipient is always
    the payer (refund) or a caller-chosen `to` (redeem). Is there any grief or reentrancy path? The
    Router is `nonReentrant` and holds nothing between calls.
 

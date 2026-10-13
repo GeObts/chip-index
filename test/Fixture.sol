@@ -24,6 +24,17 @@ import {
 } from "./mocks/Mocks.sol";
 
 /// @notice Full system on mocks: 8 stocks at the 2026-10-12 Chainlink prices, equal weight.
+/// @notice The launch mint fee schedule: 1% under $10k, 0.75% from $10k, 0.5% from $50k.
+function launchMintFees() pure returns (IndexVault.MintFeeSchedule memory) {
+    return IndexVault.MintFeeSchedule({
+        tier1MinUsd: 10_000e18,
+        tier2MinUsd: 50_000e18,
+        baseBps: 100,
+        tier1Bps: 75,
+        tier2Bps: 50
+    });
+}
+
 abstract contract Fixture is Test {
     uint256 internal constant N = 8;
     int24 internal constant TS = 10;
@@ -90,7 +101,7 @@ abstract contract Fixture is Test {
         }
 
         registry = new BasketRegistry(safe, address(sequencer), address(factory), address(usdc), cfg, ts);
-        vault = new IndexVault(safe, registry, address(policies), "Chip Index", "CHIPX", 100, 100, 300, 1_000_000e18);
+        vault = new IndexVault(safe, registry, address(policies), "Chip Index", "CHIPX", launchMintFees(), 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(safe, vault, ISlipstreamRouter(address(swap)), address(usdc), keeper);
         router = new IndexRouter(
             safe,

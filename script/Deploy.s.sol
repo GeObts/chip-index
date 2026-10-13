@@ -33,8 +33,14 @@ library LaunchConfig {
     uint256 internal constant SEED_USD_PER_STOCK = 125;
     uint256 internal constant SEED_TOKENS = 100;
 
-    // Fees (bps). Hard caps live in IndexVault: 200 / 200 / 500.
-    uint16 internal constant MINT_FEE_BPS = 100;
+    // Fees (bps). Hard caps live in IndexVault: mint 100 (every tier) / redeem 200 / mgmt 500.
+    // Mint fee is size-tiered by the NAV value of one mint (owner decision 2026-10-13):
+    // under $10,000 pays 1%, $10,000 to $49,999 pays 0.75%, $50,000 and up pays 0.5%.
+    uint256 internal constant MINT_TIER1_MIN_USD = 10_000;
+    uint256 internal constant MINT_TIER2_MIN_USD = 50_000;
+    uint16 internal constant MINT_FEE_BASE_BPS = 100;
+    uint16 internal constant MINT_FEE_TIER1_BPS = 75;
+    uint16 internal constant MINT_FEE_TIER2_BPS = 50;
     uint16 internal constant REDEEM_FEE_BPS = 100;
     uint16 internal constant MGMT_FEE_BPS = 300;
 }
@@ -105,9 +111,18 @@ contract Deploy is Script {
         uint256 maxChipBuyUsdc; // 6-dec USDC
     }
 
-    uint16 internal constant MINT_FEE_BPS = LaunchConfig.MINT_FEE_BPS;
     uint16 internal constant REDEEM_FEE_BPS = LaunchConfig.REDEEM_FEE_BPS;
     uint16 internal constant MGMT_FEE_BPS = LaunchConfig.MGMT_FEE_BPS;
+
+    function launchMintFees() public pure returns (IndexVault.MintFeeSchedule memory) {
+        return IndexVault.MintFeeSchedule({
+            tier1MinUsd: uint128(LaunchConfig.MINT_TIER1_MIN_USD * 1e18),
+            tier2MinUsd: uint128(LaunchConfig.MINT_TIER2_MIN_USD * 1e18),
+            baseBps: LaunchConfig.MINT_FEE_BASE_BPS,
+            tier1Bps: LaunchConfig.MINT_FEE_TIER1_BPS,
+            tier2Bps: LaunchConfig.MINT_FEE_TIER2_BPS
+        });
+    }
 
     function launchParams() public pure returns (Params memory) {
         return Params({
@@ -139,7 +154,7 @@ contract Deploy is Script {
             Addrs.POLICY_REGISTRY,
             p.name,
             p.symbol,
-            MINT_FEE_BPS,
+            launchMintFees(),
             REDEEM_FEE_BPS,
             MGMT_FEE_BPS,
             p.mintCap
@@ -200,7 +215,9 @@ contract Deploy is Script {
         require(d.router.keeper() == Addrs.KEEPER, "router keeper");
         require(d.splitter.keeper() == Addrs.KEEPER, "splitter keeper");
 
-        require(d.vault.mintFeeBps() == MINT_FEE_BPS, "mint fee");
+        require(
+            keccak256(abi.encode(d.vault.mintFeeSchedule())) == keccak256(abi.encode(launchMintFees())), "mint fee"
+        );
         require(d.vault.redeemFeeBps() == REDEEM_FEE_BPS, "redeem fee");
         require(d.vault.mgmtFeeBps() == MGMT_FEE_BPS, "mgmt fee");
         require(d.vault.mintCap() == p.mintCap, "mint cap");

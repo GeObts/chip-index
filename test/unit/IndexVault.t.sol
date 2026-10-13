@@ -42,7 +42,8 @@ contract IndexVaultTest is Fixture {
         assertEq(vault.balanceOf(address(splitter)), 0.1e18, "fee to the splitter");
     }
 
-    /// Mint never reads a price: it still works with every feed stale and the sequencer down.
+    /// Mint never NEEDS a price: it still works with every feed stale and the sequencer down
+    /// (the size discount then does not apply; see MintFeeTiers.t.sol).
     function test_mint_needsNoOracle() public {
         vm.warp(block.timestamp + 30 days);
         sequencer.set(1);
@@ -279,25 +280,24 @@ contract IndexVaultTest is Fixture {
     function test_feeCaps() public {
         vm.startPrank(safe);
         vm.expectRevert(abi.encodeWithSelector(IndexVault.FeeAboveCap.selector, 201, 200));
-        vault.setFees(201, 100, 300);
-        vm.expectRevert(abi.encodeWithSelector(IndexVault.FeeAboveCap.selector, 201, 200));
-        vault.setFees(100, 201, 300);
+        vault.setFees(201, 300);
         vm.expectRevert(abi.encodeWithSelector(IndexVault.FeeAboveCap.selector, 501, 500));
-        vault.setFees(100, 100, 501);
-        vault.setFees(200, 200, 500);
+        vault.setFees(100, 501);
+        vault.setFees(200, 500);
         vm.stopPrank();
-        assertEq(vault.mintFeeBps(), 200);
+        assertEq(vault.redeemFeeBps(), 200);
+        assertEq(vault.mgmtFeeBps(), 500);
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        vault.setFees(0, 0, 0);
+        vault.setFees(0, 0);
     }
 
     function test_setFees_accruesAtOldRateFirst() public {
         uint256 supply = vault.totalSupply();
         vm.warp(block.timestamp + 365 days);
         vm.prank(safe);
-        vault.setFees(100, 100, 0);
+        vault.setFees(100, 0);
         assertEq(vault.balanceOf(address(splitter)), supply * 3 / 100);
     }
 
