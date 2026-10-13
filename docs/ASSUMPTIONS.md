@@ -47,10 +47,10 @@ against every listed stock's SENDER/RECEIVER/EXECUTOR policies through Base's Po
 (`isAuthorized`). It reverts `Blocklisted(account, token)` if any of them is blocked by any stock.
 Claiming a credit checks the claimant and the destination for that stock. The Router also checks the
 cash recipient. Nothing is burned when a redeem is refused.
-**Remaining gap (not in scope of the decision):** the index token itself is freely transferable, so
-a blocklisted holder could transfer index tokens to a clean address that then redeems. Closing that
-would mean blocklist checks on index-token transfers. That is possible, but it is a larger change
-to how the token behaves.
+**Index-token transfers stay unrestricted, by owner decision (2026-10-12).** CHIDX is a plain,
+freely transferable ERC-20, with no blocklist check on `transfer`/`transferFrom`. A blocklisted holder
+can therefore move index tokens to a clean address that then redeems. This is accepted, to keep the
+index token a normal composable ERC-20.
 
 ## A-7 Fees
 - Mint 1% / redeem 1% (cap 2% each). Taken in index tokens and sent to the IndexFeeSplitter; the

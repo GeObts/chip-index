@@ -49,7 +49,14 @@ These come from the B20 tokens themselves and cannot be removed by any contract.
 | **Multiplier** changes (dividends, splits) | None: balances are raw and the feeds are total-return. | `test_fork_multiplierChange` (10× change) |
 | **Feeds freeze** nights, weekends, holidays and corporate actions | Cash mint/redeem, rebalancing and fee selling stop; in-kind paths continue. | `test_fork_staleFeed` |
 | **Denim** upgrade (scheduled, no date) applies the executor check to plain `transfer` | The vault and router are not allowlisted. If policy 5 ever became an allowlist, all stock movement would stop. | Documented (ASSUMPTIONS A-4) |
-| **Wrapper vs blocklist** | Owner decision: the vault refuses redeem and claim for any blocklisted caller, receiver or credit holder, and the router also checks the cash recipient. **Index-token transfers are not restricted**: a blocklisted holder can still transfer index tokens to a clean address, which can then redeem. | 7 unit + 6 fork tests (§6) |
+| **Wrapper vs blocklist** | Owner decision: the vault refuses redeem and claim for any blocklisted caller, receiver or credit holder, and the router also checks the cash recipient. | 7 unit + 6 fork tests (§6) |
+
+**Index-token transfers are INTENTIONALLY unrestricted (owner decision, 2026-10-12).** CHIDX is a
+plain, freely transferable OpenZeppelin ERC-20 with no blocklist, pause or hook on `transfer` or
+`transferFrom`. The blocklist is enforced only where stock leaves the vault (redeem and claim). So a
+Coinbase-blocklisted holder can transfer index tokens to a clean address, and that address can then
+redeem. This is accepted by design, to keep the index token composable. Please review the
+redeem/claim checks on their own terms, not as a complete compliance barrier.
 
 ## 5. Other trust assumptions
 - 1 USDC = $1 in the Router.
@@ -75,7 +82,7 @@ These come from the B20 tokens themselves and cannot be removed by any contract.
 | IndexFeeSplitter | 8 | fee-free redeem, 50/50 split, oracle floor, buy-and-burn, caps, sweep limits |
 | Invariants | 3 | §3 items 3 and 4, plus full redeem always succeeds: 64×100 calls by default, 512×500 in the `deep` profile (passed at 256,000 calls) |
 
-**Base mainnet fork (real B20s, feeds, Aerodrome, $CHIP v4 pool, ChipBurner): 20 passed, 0 failed.**
+**Base mainnet fork (real B20s, feeds, Aerodrome, $CHIP v4 pool, ChipBurner): 24 passed, 0 failed.**
 `./script/fork-test.sh` (base-forge)
 
 | Test | Result |
@@ -91,11 +98,24 @@ These come from the B20 tokens themselves and cannot be removed by any contract.
 | Paused token | 7 legs delivered, NVDA credited, claimed after unpause |
 | Multiplier ×10 | balances, books, NAV, redeem amounts unchanged |
 | Rebalance | drift 4.95 → 4.01 points; NAV 1,060.00 → 1,059.95 |
-| Fee pipeline (1 year) | 3% minted; $14.55 to Pot; ~20.5M $CHIP bought and burned; supply fell by exactly that |
+| Fee pipeline (1 year) | 3% minted; $14.55 to Pot; ~20.2M $CHIP bought and burned; supply fell by exactly that |
+| Small cash mints (4) | see table below; unspent ETH refunded |
+
+Small cash mints, with gas at 0.006 gwei (live 2026-10-12):
+
+| Mint | Paid | Index tokens received | Mint fee | Gas | Gas in $ |
+|---|---|---|---|---|---|
+| $20 USDC | 20.018 USDC | 1.98 | 0.02 tokens ($0.20) | 2.41M | $0.036 |
+| $5 USDC | 5.004 USDC | 0.495 | 0.005 tokens ($0.05) | 2.41M | $0.036 |
+| $20 ETH | 0.008071 ETH ($20.01) | 1.98 | 0.02 tokens ($0.20) | 3.01M | $0.045 |
+| $5 ETH | 0.002018 ETH ($5.00) | 0.495 | 0.005 tokens ($0.05) | 3.01M | $0.045 |
 
 **Measured on the fork:**
-- Small cash mints work down to $0.01. $5 → 0.495 tokens and $20 → 1.98 tokens. Network fee about
-  $0.04 (USDC, 2.4M gas) or $0.045 (ETH, 3.0M gas) at 0.006 gwei.
+- Nothing blocks small cash mints; a $0.01 USDC mint also worked in a one-off probe. Gas does not
+  depend on size (8 swaps), so it weighs most on the smallest mints.
+- Fork wallets are checked to have no code. The default `makeAddr("alice")` address carries an
+  EIP-7702 delegation on Base mainnet that forwards received ETH, which once made the router's
+  correct ETH refund look missing.
 - $CHIP buy cost versus spot: $1 0.38% · $25 0.45% · $50 0.52% · **$100 0.68%** · $250 1.13%.
 - Aerodrome WETH/USDC tick spacing 50 is the deepest pool ($1.8M USDC + 2,514 WETH).
   Stock/USDC pools (tick spacing 10) held $0.4M–$1.5M USDC each.

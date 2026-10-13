@@ -76,8 +76,10 @@ contract ChipIndexForkTest is Test {
         0xeB10A6c9aa7E537aEd766C08c35Dae35B321b18c
     ];
 
-    address internal alice = makeAddr("alice");
-    address internal bob = makeAddr("bob");
+    // NOT makeAddr("alice"): that address has code on Base mainnet (it forwards any ETH it receives),
+    // which silently ate the ETH-mint refund in an early run. setUp asserts both are plain EOAs.
+    address internal alice = makeAddr("chip-index-test-alice");
+    address internal bob = makeAddr("chip-index-test-bob");
 
     BasketRegistry internal registry;
     IndexVault internal vault;
@@ -87,6 +89,7 @@ contract ChipIndexForkTest is Test {
 
     function setUp() public {
         vm.createSelectFork(vm.envString("BASE_RPC_URL"));
+        assertEq(alice.code.length + bob.code.length, 0, "test wallets must have no code on Base");
         _freshenFeeds();
 
         BasketRegistry.AssetConfig[] memory cfg = new BasketRegistry.AssetConfig[](N);
@@ -405,6 +408,72 @@ contract ChipIndexForkTest is Test {
         assertGt(burned, 0);
         assertEq(chipSupplyBefore - IERC20(CHIP).totalSupply(), burned, "CHIP supply fell by the burn");
         assertEq(IERC20(CHIP).balanceOf(CHIP_BURNER), 0);
+    }
+
+    /* -------------------------- small cash mints ------------------------- */
+
+    /// Base gas price used to turn gas into dollars (read live 2026-10-12: 0.006 gwei).
+    /// Override with GAS_PRICE_WEI. The L1 data fee (~4.6 gwei-units, < $0.0001) is ignored.
+    function _gasUsd6(uint256 gasUsed) internal view returns (uint256) {
+        uint256 gp = vm.envOr("GAS_PRICE_WEI", uint256(6_000_000));
+        (, int256 ethUsd,,,) = IAggregatorV3(ETH_USD_FEED).latestRoundData();
+        return gasUsed * gp * uint256(ethUsd) / 1e8 / 1e12; // 6-dec dollars
+    }
+
+    function _smallUsdcMint(uint256 shares) internal {
+        deal(USDC, alice, 100e6);
+        uint256 feeBefore = vault.balanceOf(address(splitter));
+        vm.startPrank(alice);
+        IERC20(USDC).approve(address(router), type(uint256).max);
+        uint256 g = gasleft();
+        uint256 spent = router.mintWithUsdc(shares, 100e6, alice, block.timestamp + 600);
+        uint256 used = g - gasleft();
+        vm.stopPrank();
+        uint256 fee = vault.balanceOf(address(splitter)) - feeBefore;
+        console2.log("USDC paid (6 dec)          ", spent);
+        console2.log("index tokens received      ", vault.balanceOf(alice));
+        console2.log("mint fee (index tokens)    ", fee);
+        console2.log("mint fee (USD, 6 dec)      ", fee * vault.navPerShare() / 1e18 / 1e12);
+        console2.log("gas used                   ", used);
+        console2.log("gas cost (USD, 6 dec)      ", _gasUsd6(used));
+        assertEq(vault.balanceOf(alice), shares * 99 / 100);
+        assertEq(fee, shares / 100);
+    }
+
+    function _smallEthMint(uint256 shares) internal {
+        vm.deal(alice, 1 ether);
+        uint256 feeBefore = vault.balanceOf(address(splitter));
+        (, int256 ethUsd,,,) = IAggregatorV3(ETH_USD_FEED).latestRoundData();
+        vm.prank(alice);
+        uint256 g = gasleft();
+        uint256 spent = router.mintWithEth{value: 0.05 ether}(shares, alice, block.timestamp + 600);
+        uint256 used = g - gasleft();
+        uint256 fee = vault.balanceOf(address(splitter)) - feeBefore;
+        console2.log("ETH paid (wei)             ", spent);
+        console2.log("ETH paid (USD, 6 dec)      ", spent * uint256(ethUsd) / 1e8 / 1e12);
+        console2.log("index tokens received      ", vault.balanceOf(alice));
+        console2.log("mint fee (index tokens)    ", fee);
+        console2.log("mint fee (USD, 6 dec)      ", fee * vault.navPerShare() / 1e18 / 1e12);
+        console2.log("gas used                   ", used);
+        console2.log("gas cost (USD, 6 dec)      ", _gasUsd6(used));
+        assertEq(vault.balanceOf(alice), shares * 99 / 100);
+        assertEq(alice.balance, 1 ether - spent, "unspent ETH refunded");
+    }
+
+    function test_fork_smallMint_usdc20() public {
+        _smallUsdcMint(2e18); // 2 tokens at $10
+    }
+
+    function test_fork_smallMint_usdc5() public {
+        _smallUsdcMint(0.5e18);
+    }
+
+    function test_fork_smallMint_eth20() public {
+        _smallEthMint(2e18);
+    }
+
+    function test_fork_smallMint_eth5() public {
+        _smallEthMint(0.5e18);
     }
 
     /* ------------------------------------------------------------------ */
