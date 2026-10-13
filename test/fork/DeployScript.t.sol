@@ -18,7 +18,7 @@ contract DeployScriptForkTest is Test {
 
         Deploy script = new Deploy();
         Deploy.Params memory p = script.launchParams();
-        assertEq(p.mintCap, 2_500e18, "cap = 2,500 tokens = $25k at $10");
+        assertEq(p.mintCap, 5_000e18, "cap = 5,000 tokens = $50k at $10");
         assertEq(p.maxChipBuyUsdc, 100e6, "max CHIP buy = $100");
 
         Deploy.Deployed memory d = script.deploy(p);

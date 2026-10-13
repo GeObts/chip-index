@@ -1,10 +1,13 @@
 # Chip Index — response to the independent reviews
 
-**Date:** 2026-10-13. **Reviews:** ChatGPT (findings 1–2, plus 7 questions) and Bankr (M-1, M-2,
-L-1, L-2, L-3). Nothing is deployed or pushed. Every change below is in local commits only.
+**Date:** 2026-10-13. **Reviews:** round 1: ChatGPT (findings 1–2, plus 7 questions) and Bankr
+(M-1, M-2, L-1, L-2, L-3); round 2: Bankr's second review and a second round-2 review (§13); round
+3: a third review with no critical or high findings (§14). Nothing is deployed or pushed. Every
+change below is in local commits only.
 
 > **Reviewer IDs still to be matched.** The review texts have not been received yet (they were
-> not attached to either instruction, 2026-10-13). Each issue below is listed as the owner's instructions described it. The table in §1
+> not attached to any of the four instructions, 2026-10-13; rounds 2 and 3 arrived as the owner's
+> summaries). Each issue below is listed as the owner's instructions described it. The table in §1
 > leaves an empty slot to record which reviewer ID (ChatGPT 1/2, Bankr M-1/M-2/L-1/L-2/L-3) each
 > issue answers. Fill it in from the review texts before sending this back. Any ID that matches
 > none of these issues still needs its own row.
@@ -22,10 +25,18 @@ L-1, L-2, L-3). Nothing is deployed or pushed. Every change below is in local co
 | Q1–Q7 | The 7 reviewer questions (REVIEW_PACKAGE §7) | ChatGPT questions | Answered in §8 |
 | G | Self-review item 4: a stolen keeper key can drain the vault through Rebalancer ping-pong | self-review | **Fixed** (§10.1) |
 | H | Self-review item 11: Safe powers that could cost holders money were instant | self-review | **Fixed** (§10.2) |
-| I | Self-review item 10: `` buys had no hard per-call limit and no daily cap | self-review | **Fixed** (§10.2) |
+| I | Self-review item 10: $CHIP buys had no hard per-call limit and no daily cap | self-review | **Fixed** (§10.2) |
 | J | Self-review item 3: no explicit mint stop while a stock is paused or the vault is blocklisted | self-review | **Fixed** (§10.3) |
 | K | Self-review item 9: adding a stock checked nothing about the token or the feed | self-review | **Fixed**, one residual documented (§10.4) |
 | L | Self-review item 7: the 2,000 tiny mint/redeem loop was not a permanent test | self-review | **Fixed** (§10.5) |
+| C (again) | Round 2, Bankr: still claims `onRebalanceTrade` swaps with `amountOutMinimum: 0` (review identical to round 1) | Bankr round 2 | **Already fixed since 51961c9**: reviewed an older zip (§13.1) |
+| M | Round 2: stock authenticity: can Coinbase's OracleRegistry or a shared role prove a token is Coinbase-issued? | round 2 | OracleRegistry: no. Roles: copyable. **Coinbase's TokenSupplyManager register: yes, now required onchain** (§13.2) |
+| N | Round 2: deeper credit fuzzing (repeated seizures, many creditors, tiny credits, random claim order) | round 2 | **Done**: 4 invariants pass (§13.3) |
+| O | Round 2: hostile Rebalancer contract fuzzing; worst case at the cap | round 2 | **Done**: 4 invariants + worst-case test (§13.4) |
+| P | Round 2: a read-only post-deploy verification script | round 2 | **Done**: `script/VerifyDeployment.s.sol` (§13.5) |
+| Q | Round 3: confirm Coinbase's policy types per scope; effect of Denim's executor check | round 3 | **Checked onchain**: all BLOCKLIST; no change for us (§14.1) |
+| R | Round 3: use Chainlink USDC/USD in the Router instead of $1? | round 3 | **Costed, not implemented** (owner to decide) (§14.2) |
+| K / M | Basket authenticity | round 3 | **Accepted - handled operationally: addresses taken from Coinbase's official list and checked by VerifyDeployment.s.sol** (and since round 2 also enforced onchain, §13.2) |
 
 ## 2. Fix A — credits share a seizure pro-rata (IndexVault)
 
@@ -277,13 +288,13 @@ Mapping of the owner's list:
 | feed max age | registry (stocks), Router and FeeSplitter (ETH) | longer: 48h (shorter: instant) |
 | pool choice | registry: each stock's pool is now part of the basket (48h basket change); Router and FeeSplitter WETH/USDC pool | 48h only, never instant |
 | raising the mint cap | vault | 48h |
-| `` buy cap | FeeSplitter | raise: 48h; **hard limit $500 per call** (launch $100); new **daily cap $300 per 24h, hard limit $2,000** |
+| $CHIP buy cap | FeeSplitter | raise: 48h; **hard limit $500 per call** (launch $100); new **daily cap $300 per 24h, hard limit $2,000** |
 
 Also moved behind the 48h rule (they could cost holders money): router leg slippage, the vault's
 trade slippage and daily caps, the FeeSplitter's sell slippage.
 
 Unit tests: fee cut instant and rise after 48h, mint cap rise after 48h, slippage and daily caps,
-max feed age, pool change, keeper remove/add on two contracts, `` per-call hard limit and daily cap.
+max feed age, pool change, keeper remove/add on two contracts, $CHIP per-call hard limit and daily cap.
 
 ### 10.3 Mint stops while a stock is paused or the vault is blocklisted (item 3)
 
@@ -312,13 +323,12 @@ even if the Safe queues it:
 If Chainlink ever migrates its feeds, the trusted owner and code hash can be updated through the
 48h timelock only.
 
-**Residual, documented:** the B20 factory proves the token is a B20, not that Coinbase issued it.
-Anyone can create a B20 called "NVDAc" through the factory. That fake would pass checks 1, 3 and 4,
-and check 2 when paired with Chainlink's real "Coinbase NVDA" feed. Coinbase's issuer address
-cannot be read onchain: the tokens emitted no role events at creation, and the policy-5 admin
-holds no token role. So the Safe must match the token address against
-api.coinbase.com/v1/tokenized-stocks before queueing, and the 48h gives everyone else the same
-chance. Tests: 4 unit tests (fake token, untrusted owner, look-alike code, wrong pairing, re-check
+**Residual (closed in round 2, §13.2):** the B20 factory proves the token is a B20, not that
+Coinbase issued it. Anyone can create a B20 called "NVDAc" through the factory. That fake would
+pass checks 1, 3 and 4, and check 2 when paired with Chainlink's real "Coinbase NVDA" feed. *This
+section originally said Coinbase's issuer could not be found onchain because the tokens emitted no
+events at creation. That was wrong: the creation transaction does emit them (my log query had
+missed it). Round 2 found Coinbase's own token register and now requires it.* Tests: 4 unit tests (fake token, untrusted owner, look-alike code, wrong pairing, re-check
 at execute) and one fork test on the real chain (fake ERC-20, NVDA with MSTR's feed, look-alike
 feed naming Chainlink's owner; the genuine basket passes).
 
@@ -329,14 +339,14 @@ $0.01). NAV per token started at $9.99999983 and never went below that (lowest s
 since rounding always leaves dust in the vault). No user got more of any stock out than they put
 in. (`foundry.toml` now allows 4B gas per test; this one uses 1.37B.)
 
-## 11. Worst case for a stolen keeper key (launch settings, $25,000 NAV)
+## 11. Worst case for a stolen keeper key (launch settings, $25,000 NAV; at the new $50,000 cap every holders'-value figure doubles, see §13.4)
 
 The keeper key is used by three contracts. Until the Safe removes it (instant, one transaction):
 
 | Contract | What a thief can do | Worst case |
 |---|---|---|
 | Rebalancer | Only rebalances that obey the rules above, at the worst allowed fill (0.75%) | ~0.03% of NAV per eligible episode ($7.50 at $25k), then nothing until drift exceeds 3 points again or 30 days pass. Hard ceiling enforced by the vault: **$25 per 24h window** (0.10%), at most $50 if two windows fall in one 24h span. Chainlink can lag the market by up to 0.5%, so the true market loss on the traded volume could be up to ~0.05% of NAV more. |
-| IndexFeeSplitter | Sell fee stock for USDC (Chainlink floor, 1%), buy `` with a bad `minChipOut` and sandwich it | Fee money only, never holders' stock: at most **$300 per day** of the `` budget ($100 per call). Selling at the 1% floor costs at most 1% of the fee stock sold. |
+| IndexFeeSplitter | Sell fee stock for USDC (Chainlink floor, 1%), buy $CHIP with a bad `minChipOut` and sandwich it | Fee money only, never holders' stock: at most **$300 per day** of the $CHIP budget ($100 per call). Selling at the 1% floor costs at most 1% of the fee stock sold. |
 | IndexRouter | Pause cash mint/redeem | No money: the Safe unpauses, and in-kind redeem never stops |
 
 **Total: about $25–50 of holders' value per day plus up to $300 per day of fee money**, versus
@@ -356,3 +366,240 @@ fee-money cap does not.
     blocklist.
   - The deploy rehearsal now also proves the real launch basket passes every authenticity check.
   - Both rebalance tests now spread the sale over all 7 underweight stocks.
+
+## 13. Round 2 (2026-10-13)
+
+The round-2 review texts were not attached; the items below are as the owner summarized them.
+
+### 13.1 Bankr round 2: "`amountOutMinimum: 0`" (identical to round 1)
+
+That finding was fixed in round 1 (commit 51961c9) and is still fixed. Bankr's round-2 text
+matches its round-1 text exactly, so it most likely reviewed the pre-fix package. Both review
+packages carried the same file name, `chip-index-review.zip`.
+
+- **Where the minimum is set:** `src/Rebalancer.sol` lines 135–137 compute
+  `minOut = registry.amountForUsd(tokenOut, registry.valueUsd(tokenIn, amountIn) * (BPS - vault.maxTradeSlippageBps()) / BPS)`
+  (Chainlink value minus 0.75%), and line 147 passes it as `amountOutMinimum: minOut`. The vault
+  re-checks value in vs out after the swap (`IndexVault.executeTrade`).
+- **Proof on the real chain:** `test_fork_rebalanceSwapHasChainlinkMinimum` expects the exact
+  minimum on the Aerodrome call (minimum 0.04374 MSTR, received 0.04418).
+- **Which package to review:** the zip that went out before this round was SHA-256
+  `2DE45B06325E1256D6F368907255C876B78A9AFC72EB9231012A0BF7E71F429F`, built 2026-10-13 11:53
+  (UTC-6) from commit 851d62f, and already had these lines. The new package, rebuilt after this
+  round, contains a `REVIEW_VERSION.txt` with its commit and build time. Its own hash is given to
+  the owner with the package, since a file cannot contain its own hash.
+
+### 13.2 Stock authenticity: can anything onchain prove Coinbase issued a token?
+
+Checked on Base mainnet, 2026-10-13:
+
+| Candidate | Proves Coinbase issued it? | Why |
+|---|---|---|
+| Coinbase **OracleRegistry** `0x3f3E…5CaD` (multiplier + pause flag per token, read by the feeds) | **No** | Verified source: it keeps only a `paused` flag per address and reads `multiplier()` live from whatever address it is given. It has no list of tokens, so it answers for a copycat exactly as for NVDA (shown in the fork test). |
+| **Shared roles** on the 8 stocks: admin `0x3846…72B1`, operator `0x5Da4…4D9A`, and MINT_ROLE held by the TokenSupplyManager | **No** | All 8 share them, but any B20 creator can grant any role to any address. The fork test builds a copycat holding the same three role assignments. |
+| **B20 address derivation** (`getB20Address(variant, creator, salt)`): every Coinbase stock is created by Coinbase's `B20AssetFactory` proxy `0x4bA3…534D` | Yes, but needs each token's salt | Would require the Safe to supply a salt per token. Not used; the register below is simpler. |
+| Coinbase **TokenSupplyManager** `0xD1Ca…664C` (the contract that mints and redeems the stocks), `isRegisteredToken(token)` | **Yes** | Only its admin (`DEFAULT_ADMIN_ROLE`) can register a token, in the same transaction that creates it. All **145** tokens on Coinbase's list are registered; USDC, $CHIP and a copycat are not. |
+
+**Now required onchain.** `BasketRegistry._checkAuthentic` refuses any stock that the
+TokenSupplyManager has not registered (`NotCoinbaseIssued`). This check runs when a basket is
+queued and again when it executes, so a stock Coinbase deregisters in between is refused too.
+- **Moving the register:** if Coinbase ever moves it, the address can be changed through the 48h
+  timelock only (`SET_ISSUER_REGISTRY`).
+- **Tests:**
+  - 2 new unit tests: unregistered refused at queue and at execute; the setting is 48h-only.
+  - New fork test `test_fork_basketRejectsCopycatB20`. A REAL B20 is created through Base's
+    factory with MSFT's name, symbol "MSFTc", 8 decimals and Coinbase's policy 5. Coinbase's admin,
+    operator and TokenSupplyManager are granted the same roles they hold on the real MSFT.
+  - Paired with MSFT's real Chainlink feed, that copycat passes the B20 factory, role and
+    OracleRegistry checks, and the basket refuses it with `NotCoinbaseIssued`.
+- **What remains:** the check trusts Coinbase's register, which is an upgradeable Coinbase
+  contract. The register also holds 156 registrations against 145 listed tokens, so some
+  registered tokens are not on the public list. The Safe therefore still takes addresses from
+  Coinbase's official list, and `VerifyDeployment.s.sol` checks them (§13.5).
+
+### 13.3 Deeper credit fuzzing
+
+`test/invariant/CreditInvariants.t.sol`: twelve creditors, each starting with 5 index tokens. The
+fuzzer picks the next action at random from:
+- a redeem while a random set of stocks is paused, a third of the time for a tiny amount (down to
+  1 wei of index token), with the stuck legs credited to a random account;
+- an issuer seizure of 0–100% of the vault's balance of one stock, then `sync`;
+- claims in random order;
+- mints, unpauses and time jumps.
+
+Invariants (24 runs × 100 calls each by default, more in the `deep` profile):
+1. **Per stock, everything ever paid out on credits plus everything still owed never exceeds what
+   redeems set aside as credit.**
+2. The vault's balance always covers index backing plus credits.
+3. Individual credits add up to the pool, short only by rounding (under 1 unit per account).
+4. **Everyone can exit:** with everything unpaused, every creditor claims every credit and every
+   holder redeems everything, all successfully, leaving at most rounding dust owed.
+
+All four pass.
+
+### 13.4 Hostile Rebalancer contract
+
+`test/invariant/HostileRebalancer.t.sol` installs an attacker's Rebalancer through the 48h
+timelock. It holds its own stash of every stock, so it can pay back anything from nothing to 101%
+of fair value. The fuzzer tries every trade it can make:
+- any pair of stocks (including the same stock on both sides) and any size, from 0.01% to 100% of
+  the vault's holding;
+- paying in the wrong stock, keeping everything, or handing part of the input back;
+- re-entering the vault from inside the trade callback (sync, a nested trade, redeem, claim,
+  accrue);
+- price moves of ±5% and time jumps of up to 3 days.
+
+Invariants: Chainlink value lost per vault window is ≤ 0.10% of the window's NAV; ≤ 0.20% in any
+24h span (two back-to-back windows); no re-entry ever succeeds; the books stay covered. All pass.
+Every accepted trade's loss also equals the vault's NAV drop, to within rounding. The fuzzer is biased so
+about half its trades land (one run: 20 accepted, 17 refused); the worst window it reached was
+0.083% of NAV, against the 0.10% cap. The directed test below reaches the cap exactly.
+
+**Worst case in dollars** (`test_hostile_worstCaseDollars`): the best strategy is to lose as close
+to 0.75% per trade as allowed until the cap, then open the next window exactly 24h later.
+
+| NAV | Window 1 | Window 2 (24h later) | Most in any 24h span | Steady rate |
+|---|---|---|---|---|
+| $25,000 | $24.99 | $24.97 | **$49.96** | $25 per day |
+| $50,000 (new launch cap) | $49.99 | $49.94 | **$99.93** | $50 per day |
+
+These are Chainlink-value losses. Chainlink can lag the market (it updates on a 0.5% move or every
+24h), so a hostile contract that sells a stock Chainlink underprices and pays in one it overprices
+could take up to about 1% of the traded volume on top. The vault caps volume at 15% of NAV per
+window, so that adds at most about 0.15% of NAV per window: **$75 at $50k (about $150 in the worst
+24h span), or about $250 in total in that span.** A hostile Rebalancer needs a 48h timelocked
+change that anyone can see, and the Safe can stop all rebalance trading instantly
+(`vault.tighten(SET_MAX_TRADE_SLIPPAGE, 0)`).
+
+**Stolen keeper key at the new $50k cap** (the §11 figures doubled): the Rebalancer's own rules
+cost about $15 per eligible episode, with the vault's ceiling at $50 per window ($100 if two windows
+fall in one 24h span). The fee money cap ($300 per day) does not change.
+
+### 13.5 `script/VerifyDeployment.s.sol`
+
+A read-only script for after the deploy. It sends nothing and needs no key, and it prints one PASS
+or FAIL line per check: 150 for the launch basket. It checks:
+- every owner is the Safe, with no ownership transfer pending;
+- the wiring between the five contracts;
+- the keepers, every fee, cap and limit, and the 48h timelock;
+- **no queued change waiting** on any of the five contracts;
+- for each stock: on Coinbase's live list with the same symbol, a B20, in Coinbase's register,
+  its feed named "Coinbase <TICKER>" with Chainlink's owner and code, and its pool.
+
+How to run it is in DEPLOY.md §3a.
+- **Queued changes, a small contract change:** reading them from event history did not work with
+  free infrastructure. Base's public RPC rate-limits `eth_getLogs`, the free RPCs cap the range or
+  need a token, and Blockscout blocks scripted requests. So each contract's timelock now lists its
+  waiting changes onchain, in `pendingChanges()` (`src/lib/Timelock.sol`, 2 new unit tests). This
+  also lets anyone monitor what is queued with one read.
+- **Size:** IndexVault grows by about 0.6 KB to 23,064 bytes, 1,512 bytes under the 24,576-byte
+  limit.
+- **Rehearsed on a Base fork:**
+  - A clean deploy gives 150 PASS and 0 FAIL.
+  - Five planted problems give exactly 5 FAIL lines: a queued change, an unaccepted ownership
+    transfer, a removed keeper, and a stock missing from Coinbase's list (two lines).
+  - The live Coinbase fetch read all pages.
+
+### 13.6 Launch mint cap raised to 5,000 CHIPX ($50,000 at $10)
+
+Owner decision, 2026-10-13. Changed in `LaunchConfig` (script/Deploy.s.sol). `Deploy.verify`, the
+deploy-script fork test and `VerifyDeployment.s.sol` all check the new value. One $50k mint still
+cannot fit under the cap, so the 0.5% tier is not reachable until the Safe raises it.
+
+## 14. Round 3 (2026-10-13): no critical or high findings
+
+### 14.1 Coinbase policy types, and Base's Denim upgrade
+
+Read onchain on all 8 stocks (Base mainnet, 2026-10-13):
+
+| Scope | Policy id | Type |
+|---|---|---|
+| TRANSFER_SENDER_POLICY | 5 | BLOCKLIST |
+| TRANSFER_RECEIVER_POLICY | 5 | BLOCKLIST |
+| TRANSFER_EXECUTOR_POLICY | 5 | BLOCKLIST |
+| MINT_RECEIVER_POLICY | 5 | BLOCKLIST |
+| SEIZE_EXEMPT_POLICY | 129 | BLOCKLIST (authorized = exempt, so everyone is exempt until Coinbase lists them) |
+| SEIZE_RECEIVER_POLICY | 0 | unset (always allow) |
+
+How the type was confirmed:
+- The type is the top byte of the id (`id >> 56`), which is 0 = BLOCKLIST for both 5 and 129.
+- `compositePolicyChildIds` returns no children, so neither is a UNION or INTERSECT.
+- A fresh address is authorized under both.
+- Policy 5's admin is `0xEC0F…2812`; policy 129's is Coinbase's token admin `0x3846…72B1`.
+
+**If Base checks the executor on plain `transfer()`** (which is exactly what Denim does):
+- On every stock, the sender and executor scopes are the same policy, 5. For a plain `transfer`,
+  the executor is the sender (`msg.sender == from`). So the new check asks policy 5 the same
+  question the sender check already asks, and gets the same answer.
+- For the vault (redeem legs, claims, trades), the Rebalancer and the Router (paying out stock and
+  WETH/USDC), and the fee splitter (selling fee stock), **nothing changes while none of them is
+  blocklisted**.
+- The Aerodrome router and pools already pass the executor check today, on every `transferFrom`
+  where they are not the sender.
+- The mint check `_requireMintable` already requires the vault to be authorized on all three
+  transfer scopes.
+- It would only matter if Coinbase pointed the executor scope at a different, allowlist-style
+  policy, such as "only our transfer agent may initiate". Then every contract here, and every DEX
+  pool, would stop moving these stocks:
+  - In-kind redeem would credit each leg instead of reverting.
+  - Mint would refuse up front.
+  - Rebalancing and cash paths would revert.
+  - No funds would be lost, but they would be frozen until Coinbase changed it back.
+- Denim's other B20 change makes a send to the token's own address revert. The vault never does
+  that itself, and a redeem whose receiver is a token address gets that leg credited, not lost.
+
+**Official Base information found:**
+- docs.base.org/upgrades/denim/overview lists Denim as **Sepolia: scheduled October 21, 2026;
+  mainnet: "planning", November 2026** (no exact time).
+- It includes 200ms blocks, a millisecond BaseTime predeploy, and B20 changes ("transfers, mints,
+  and seizes to the token's own address revert, `TRANSFER_EXECUTOR_POLICY` applies to every
+  transfer path, and any policy can be inverted with a NOT flag").
+- Base's base-std v2.0.0-Denim release and its changelog
+  `03_Denim_B20_transfer_executor_enforcement.md` describe the same executor change.
+
+The 200ms blocks do not affect Chip Index: nothing here counts blocks; the 24h windows, timelocks
+and feed ages all use `block.timestamp`.
+
+### 14.2 Chainlink USDC/USD instead of $1 (not implemented; owner to decide)
+
+- **Feed on Base:** `0x7e860098F58bBFC8648a4311b374B1D669a2bc6B`, "USDC / USD", 8 decimals.
+  Read 2026-10-13: $0.99986, updated about 7h earlier. It has the same Chainlink owner and proxy
+  code as our stock feeds.
+- **Where $1 is assumed today:**
+  - Router `_maxUsdcFor` (most USDC a mint leg may spend) and `_minUsdcFor` (least USDC a redeem
+    leg must return);
+  - FeeSplitter `sellForUsdc` (the Chainlink floor on fee stock sold) and the USDC→WETH step of
+    `buyAndBurn`.
+  - NAV, mint and in-kind redeem never touch USDC. The Rebalancer's minimum is stock-to-stock, so
+    USDC drops out of it.
+- **What happens today if USDC moves:**
+  - Below $1: those limits become too tight, so USDC mints and redeems revert. That fails closed:
+    users can still mint and redeem in kind.
+  - Above $1 (rare): the redeem floor is lower than fair by the premium, inside the 1% leg
+    tolerance.
+  - So the $1 assumption can block the cash paths, but it cannot make users or holders lose more
+    than the existing 1% per-leg tolerance.
+- **Size of the change:**
+  - About 30 lines in the Router: one immutable feed, one max-age setting (48h to loosen), and
+    two helpers that divide by the USDC price.
+  - About 15 lines in the FeeSplitter.
+  - New deploy constants and verify checks, and about 8 unit tests plus 2 fork tests.
+  - No change to the vault, so its size is unaffected.
+- **Risk of the change:**
+  - It adds one more feed that can go stale. Its heartbeat is up to 24h, so a weekend could pause
+    the cash paths more often unless the max age is set generously.
+  - It adds new code on the money path.
+  - The benefit only appears during a depeg, when blocking cash mints may actually be the safer
+    behaviour.
+- **Recommendation:** leave it as is for launch, and revisit if USDC trades outside about ±0.3%.
+
+## 15. Test counts after rounds 2 and 3 (2026-10-13)
+
+- **Unit + invariant (mocks): 147 passed, 0 failed** (was 134).
+  - New: 4 credit invariants, 4 hostile-Rebalancer invariants plus the worst-case test, 2
+    pending-change tests, 2 registry tests (Coinbase register).
+- **Base mainnet fork: 40 passed, 0 failed** (was 37).
+  - New: the copycat B20 refused by Coinbase's register, and 2 VerifyDeployment rehearsals.
+  - The deploy rehearsal now checks the 5,000-token cap and the register.
+- Forge 1.8.x groups each invariant suite into one line, so it shows a lower unit count. Every
+  invariant still runs.

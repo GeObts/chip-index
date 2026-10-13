@@ -15,6 +15,7 @@ import {
     MockAggregator,
     MockB20,
     MockB20Factory,
+    MockIssuerRegistry,
     MockChipBurner,
     MockERC20,
     MockPolicyRegistry,
@@ -63,6 +64,7 @@ abstract contract Fixture is Test {
     MockChipBurner internal burner;
     MockPolicyRegistry internal policies;
     MockB20Factory internal b20Factory;
+    MockIssuerRegistry internal issuers;
 
     BasketRegistry internal registry;
     IndexVault internal vault;
@@ -86,6 +88,7 @@ abstract contract Fixture is Test {
         burner = new MockChipBurner(chip);
         policies = new MockPolicyRegistry();
         b20Factory = new MockB20Factory();
+        issuers = new MockIssuerRegistry();
 
         swap.setPrice(address(usdc), 1e18);
         swap.setPrice(address(weth), 2_600e18);
@@ -98,12 +101,15 @@ abstract contract Fixture is Test {
             feeds[i] = new MockAggregator(8, prices8[i]);
             feeds[i].setDescription(string.concat("Coinbase ", tickers[i]));
             b20Factory.setB20(address(stocks[i]), true);
+            issuers.setRegistered(address(stocks[i]), true);
             factory.setPool(address(stocks[i]), address(usdc), TS);
             swap.setPrice(address(stocks[i]), uint256(prices8[i]) * 1e10);
             cfg[i] = BasketRegistry.AssetConfig(address(stocks[i]), address(feeds[i]), 1_250, TS);
         }
 
-        registry = new BasketRegistry(safe, address(sequencer), address(factory), address(usdc), address(b20Factory), cfg);
+        registry = new BasketRegistry(
+            safe, address(sequencer), address(factory), address(usdc), address(b20Factory), address(issuers), cfg
+        );
         vault = new IndexVault(safe, registry, address(policies), "Chip Index", "CHIPX", launchMintFees(), 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(safe, vault, ISlipstreamRouter(address(swap)), address(usdc), keeper);
         router = new IndexRouter(

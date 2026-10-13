@@ -5,9 +5,11 @@ import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IB20} from "base-std/interfaces/IB20.sol";
 import {IPolicyRegistry} from "base-std/interfaces/IPolicyRegistry.sol";
+import {IB20Factory} from "base-std/interfaces/IB20Factory.sol";
+import {B20FactoryLib} from "base-std/lib/B20FactoryLib.sol";
 import {MockB20Storage} from "base-std-test/lib/mocks/MockB20Storage.sol";
 
-import {BasketRegistry} from "../../src/BasketRegistry.sol";
+import {BasketRegistry, IB20FactoryView, IIssuerRegistry} from "../../src/BasketRegistry.sol";
 import {IndexFeeSplitter} from "../../src/IndexFeeSplitter.sol";
 import {IndexRouter} from "../../src/IndexRouter.sol";
 import {IndexVault} from "../../src/IndexVault.sol";
@@ -52,6 +54,13 @@ abstract contract ChipIndexForkBase is Test {
     address constant B20_FACTORY = 0xB20f000000000000000000000000000000000000;
     address constant CHAINLINK_FEED_OWNER = 0xf0Db7318A51a21C413CaDd4AbDC1E8a500fE5B1b;
     address constant POLICY_ADMIN = 0xEC0F05C174e54FBf0Fe16ad930a8AFEbCe612812;
+    /// Coinbase's TokenSupplyManager proxy: its admin-only register `isRegisteredToken`.
+    address constant COINBASE_TOKEN_REGISTRY = 0xD1Ca4dAcdf3231011D175351f1f02D15C7c5664C;
+    /// Coinbase's OracleRegistry (multiplier + pause flag per token, read by the Chainlink feeds).
+    address constant COINBASE_ORACLE_REGISTRY = 0x3f3E8cf41cdd3b1D118c16471aB0113DfDDd5CaD;
+    /// Role holders shared by all 8 launch stocks (read onchain 2026-10-13).
+    address constant COINBASE_TOKEN_ADMIN = 0x38467bE00970af18076fd08F6b4Cf38Ba91572B1;
+    address constant COINBASE_TOKEN_OPERATOR = 0x5Da41bDDc73406F246d73CbE2e319f3cFc814D9A;
     uint64 constant COINBASE_BLOCKLIST = 5;
     int24 constant STOCK_TS = 10;
     int24 constant WETH_USDC_TS = 50;
@@ -109,7 +118,7 @@ abstract contract ChipIndexForkBase is Test {
         for (uint256 i; i < N; ++i) {
             cfg[i] = BasketRegistry.AssetConfig(tokens[i], feedAddrs[i], 1_250, STOCK_TS);
         }
-        registry = new BasketRegistry(SAFE, SEQUENCER_FEED, SLIP_FACTORY, USDC, B20_FACTORY, cfg);
+        registry = new BasketRegistry(SAFE, SEQUENCER_FEED, SLIP_FACTORY, USDC, B20_FACTORY, COINBASE_TOKEN_REGISTRY, cfg);
         vault = new IndexVault(SAFE, registry, POLICY_REGISTRY, "Chip Index", "CHIPX", _launchMintFees(), 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(SAFE, vault, ISlipstreamRouter(SLIP_ROUTER), USDC, KEEPER);
         router = new IndexRouter(
@@ -534,6 +543,59 @@ contract ChipIndexForkTest is ChipIndexForkBase {
         // The genuine basket queues fine.
         cfg[0].feed = feedAddrs[0];
         vm.prank(SAFE);
+        registry.queueBasket(cfg);
+    }
+
+    /// A REAL B20, created through Base's B20 factory, that copies everything about MSFT that
+    /// anyone can copy: name, symbol "MSFTc", 8 decimals, Coinbase's blocklist policy 5, and even
+    /// Coinbase's admin, operator and TokenSupplyManager as role holders (any creator can grant
+    /// roles to any address). The B20 factory, the role checks and Coinbase's OracleRegistry all
+    /// accept it. Only Coinbase's TokenSupplyManager register tells it apart, and the basket
+    /// refuses it with NotCoinbaseIssued.
+    function test_fork_basketRejectsCopycatB20() public {
+        bytes32 mintRole = keccak256("MINT_ROLE");
+        bytes32 operatorRole = keccak256("OPERATOR_ROLE");
+        bytes[] memory init = new bytes[](6);
+        init[0] = B20FactoryLib.encodeGrantRole(bytes32(0), COINBASE_TOKEN_ADMIN);
+        init[1] = B20FactoryLib.encodeGrantRole(operatorRole, COINBASE_TOKEN_OPERATOR);
+        init[2] = B20FactoryLib.encodeGrantRole(mintRole, COINBASE_TOKEN_REGISTRY);
+        init[3] = B20FactoryLib.encodeUpdatePolicy(keccak256("TRANSFER_SENDER_POLICY"), COINBASE_BLOCKLIST);
+        init[4] = B20FactoryLib.encodeUpdatePolicy(keccak256("TRANSFER_RECEIVER_POLICY"), COINBASE_BLOCKLIST);
+        init[5] = B20FactoryLib.encodeUpdatePolicy(keccak256("TRANSFER_EXECUTOR_POLICY"), COINBASE_BLOCKLIST);
+        address attacker = makeAddr("chip-index-test-copycat");
+        vm.prank(attacker);
+        address copycat = IB20Factory(B20_FACTORY).createB20(
+            IB20Factory.B20Variant.ASSET,
+            keccak256("copycat MSFT"),
+            B20FactoryLib.encodeAssetCreateParams("Microsoft Corporation", "MSFTc", attacker, 8),
+            init
+        );
+
+        // Everything a contract can read looks like the real MSFT ...
+        assertTrue(IB20FactoryView(B20_FACTORY).isB20Initialized(copycat), "a genuine B20");
+        assertEq(IB20(copycat).symbol(), IB20(tokens[7]).symbol());
+        assertEq(IB20(copycat).decimals(), IB20(tokens[7]).decimals());
+        assertTrue(IB20(copycat).hasRole(bytes32(0), COINBASE_TOKEN_ADMIN) && IB20(tokens[7]).hasRole(bytes32(0), COINBASE_TOKEN_ADMIN));
+        assertTrue(IB20(copycat).hasRole(operatorRole, COINBASE_TOKEN_OPERATOR));
+        assertTrue(IB20(copycat).hasRole(mintRole, COINBASE_TOKEN_REGISTRY) && IB20(tokens[7]).hasRole(mintRole, COINBASE_TOKEN_REGISTRY));
+        assertEq(IB20(copycat).policyId(keccak256("TRANSFER_EXECUTOR_POLICY")), COINBASE_BLOCKLIST);
+        // ... and Coinbase's OracleRegistry answers for it like any other token (it keeps no list).
+        (bool okOracle,) = COINBASE_ORACLE_REGISTRY.staticcall(abi.encodeWithSignature("getOracleParams(address)", copycat));
+        assertTrue(okOracle, "OracleRegistry cannot tell a copycat apart");
+
+        // Only the TokenSupplyManager register can.
+        assertFalse(IIssuerRegistry(COINBASE_TOKEN_REGISTRY).isRegisteredToken(copycat));
+        for (uint256 i; i < N; ++i) {
+            assertTrue(IIssuerRegistry(COINBASE_TOKEN_REGISTRY).isRegisteredToken(tokens[i]), "launch stock registered");
+        }
+
+        BasketRegistry.AssetConfig[] memory cfg = new BasketRegistry.AssetConfig[](N);
+        for (uint256 i; i < N; ++i) {
+            cfg[i] = BasketRegistry.AssetConfig(tokens[i], feedAddrs[i], 1_250, STOCK_TS);
+        }
+        cfg[7].token = copycat; // with MSFT's real feed ("Coinbase MSFT")
+        vm.prank(SAFE);
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.NotCoinbaseIssued.selector, copycat));
         registry.queueBasket(cfg);
     }
 

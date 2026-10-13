@@ -115,6 +115,7 @@ contract BasketRegistryTest is Fixture {
         MockAggregator coinFeed = new MockAggregator(8, 300e8);
         factory.setPool(address(coin), address(usdc), TS);
         b20Factory.setB20(address(coin), true);
+        issuers.setRegistered(address(coin), true);
         coinFeed.setDescription("Coinbase COIN");
 
         BasketRegistry.AssetConfig[] memory cfg = _basket();
@@ -303,6 +304,7 @@ contract BasketRegistryTest is Fixture {
         t = new MockB20(symbol, symbol, policies, 99);
         factory.setPool(address(t), address(usdc), TS);
         b20Factory.setB20(address(t), isB20);
+        issuers.setRegistered(address(t), isB20);
     }
 
     /// A plain ERC-20 (not created by Base's B20 factory) is refused, even when the Safe queues it.
@@ -311,6 +313,45 @@ contract BasketRegistryTest is Fixture {
         address feed = address(_newFeed("Coinbase COIN"));
         vm.expectRevert(abi.encodeWithSelector(BasketRegistry.NotB20.selector, address(fake)));
         this.queueWithLast(address(fake), feed);
+    }
+
+    /// A genuine B20 with a copied symbol ("COINc", matching feed, real pool) that Coinbase's
+    /// TokenSupplyManager has not registered is refused: anyone can create a B20, only Coinbase
+    /// can register one.
+    function test_authenticity_unregisteredB20Rejected() public {
+        MockB20 copycat = _newStock("COINc", true);
+        issuers.setRegistered(address(copycat), false);
+        address feed = address(_newFeed("Coinbase COIN"));
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.NotCoinbaseIssued.selector, address(copycat)));
+        this.queueWithLast(address(copycat), feed);
+
+        // Registered when queued but deregistered by Coinbase before execute: refused at execute.
+        issuers.setRegistered(address(copycat), true);
+        BasketRegistry.AssetConfig[] memory cfg = _basket();
+        cfg[7] = BasketRegistry.AssetConfig(address(copycat), feed, 1_250, TS);
+        vm.prank(safe);
+        registry.queueBasket(cfg);
+        issuers.setRegistered(address(copycat), false);
+        vm.warp(block.timestamp + 48 hours);
+        _freshFeeds();
+        vm.prank(safe);
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.NotCoinbaseIssued.selector, address(copycat)));
+        registry.executeBasket(cfg);
+    }
+
+    /// Moving the issuer register is a 48h change only, never instant.
+    function test_issuerRegistry_timelockOnly() public {
+        uint8 key = registry.SET_ISSUER_REGISTRY();
+        assertEq(registry.issuerRegistry(), address(issuers));
+        vm.prank(safe);
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, key, uint256(uint160(alice))));
+        registry.tighten(key, uint160(alice));
+        vm.prank(safe);
+        registry.queueSetting(key, uint160(alice));
+        vm.warp(block.timestamp + 48 hours);
+        vm.prank(safe);
+        registry.executeSetting(key, uint160(alice));
+        assertEq(registry.issuerRegistry(), alice);
     }
 
     /// A feed that is not one of Chainlink's (different code, or a different owner) is refused.

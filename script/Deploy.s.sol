@@ -22,9 +22,10 @@ library LaunchConfig {
     string internal constant SYMBOL = "CHIPX";
 
     /// Total cap on index tokens in existence, for ALL holders together (no per-wallet limit).
-    /// 2,500 tokens = $25,000 at the $10 launch price. The Safe can lower it instantly, or raise it
-    /// through the 48h timelock (vault.queueSetting(SET_MINT_CAP, ...)).
-    uint256 internal constant MINT_CAP_TOKENS = 2_500;
+    /// 5,000 tokens = $50,000 at the $10 launch price (owner decision 2026-10-13, was 2,500).
+    /// The Safe can lower it instantly, or raise it through the 48h timelock
+    /// (vault.queueSetting(SET_MINT_CAP, ...)).
+    uint256 internal constant MINT_CAP_TOKENS = 5_000;
 
     /// Most USDC one $CHIP buy may spend. Fork-measured 2026-10-12: a $100 buy fills 0.68% worse
     /// than spot (pool fee ~0.38% + impact ~0.30%), inside the 1% limit; $250 was 1.13%.
@@ -67,7 +68,12 @@ library Addrs {
     address internal constant B20_FACTORY = 0xB20f000000000000000000000000000000000000;
     /// Owner of all 8 Coinbase stock feeds and the ETH/USD feed (Chainlink's Base multisig),
     /// read onchain 2026-10-13. The registry takes it from the first launch feed; verify checks it.
-    address internal constant CHAINLINK_FEED_OWNER = 0xf0Db7318A51a21C413CaDd4AbDC1E8a500fE5B1b;    uint24 internal constant CHIP_POOL_FEE = 0x800000; // dynamic-fee flag
+    address internal constant CHAINLINK_FEED_OWNER = 0xf0Db7318A51a21C413CaDd4AbDC1E8a500fE5B1b;
+    /// Coinbase's TokenSupplyManager (ERC1967 proxy): mints/redeems the Coinbase stocks and keeps the
+    /// admin-only register `isRegisteredToken`. All 135 tokens on the Coinbase API are registered
+    /// (checked onchain 2026-10-13); it is set in the same tx that creates each token.
+    address internal constant COINBASE_TOKEN_REGISTRY = 0xD1Ca4dAcdf3231011D175351f1f02D15C7c5664C;
+    uint24 internal constant CHIP_POOL_FEE = 0x800000; // dynamic-fee flag
     int24 internal constant CHIP_POOL_TS = 200;
     int24 internal constant STOCK_USDC_TS = 10; // every B20/USDC pool with real depth
     int24 internal constant WETH_USDC_TS = 50; // deepest Aerodrome WETH/USDC pool
@@ -150,7 +156,8 @@ contract Deploy is Script {
 
     function deploy(Params memory p) public returns (Deployed memory d) {
         d.registry = new BasketRegistry(
-            Addrs.SAFE, Addrs.SEQUENCER_FEED, Addrs.SLIP_FACTORY, Addrs.USDC, Addrs.B20_FACTORY, Addrs.basket()
+            Addrs.SAFE, Addrs.SEQUENCER_FEED, Addrs.SLIP_FACTORY, Addrs.USDC, Addrs.B20_FACTORY, Addrs.COINBASE_TOKEN_REGISTRY,
+            Addrs.basket()
         );
         d.vault = new IndexVault(
             Addrs.SAFE,
@@ -236,6 +243,7 @@ contract Deploy is Script {
         require(d.vault.dailyTradeCapBps() == 1_500 && d.vault.dailyLossCapBps() == 10, "daily trade caps");
         require(d.registry.trustedFeedOwner() == Addrs.CHAINLINK_FEED_OWNER, "trusted feed owner");
         require(address(d.registry.b20Factory()) == Addrs.B20_FACTORY, "b20 factory");
+        require(d.registry.issuerRegistry() == Addrs.COINBASE_TOKEN_REGISTRY, "coinbase token registry");
 
         BasketRegistry.AssetConfig[] memory cfg = Addrs.basket();
         require(d.registry.assetCount() == cfg.length, "basket size");

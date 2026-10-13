@@ -26,7 +26,7 @@ Addresses verified 2026-10-12 against api.coinbase.com/v1/tokenized-stocks (all 
 | In-kind mint / redeem | Pro-rata against current holdings, so no oracle is involved and it can't be gamed with a stale price. Redeem can never be paused. A leg that fails (token paused, vault blocklisted) is credited to the redeemer and claimable later, so the other legs still pay out. |
 | Cash mint / redeem | Router swaps ETH/USDC ↔ all 8 legs. The user sets a minimum out, and each leg must land within 1% of the Chainlink price. Cash mint is blocked if any feed is stale. Cash redeem is pausable for emergencies; in-kind redeem never is. |
 | Valuation | raw balance × feed price. Feeds are total-return, and the Coinbase `multiplier` equals onchain `multiplier()`. |
-| Mint cap | Global cap on index totalSupply (no per-wallet cap): 2,500 tokens = $25,000 at launch, Safe-raisable. |
+| Mint cap | Global cap on index totalSupply (no per-wallet cap): 5,000 tokens = $50,000 at launch (owner decision 2026-10-13, was 2,500), Safe-raisable. |
 | Blocklist | Redeem and claim are refused for any Coinbase-blocklisted caller, receiver or credit holder (owner decision 2026-10-12). |
 | Launch | "Chip Index"/"CHIPX"; seed $1,000 for 100 tokens; $CHIP buys at most $100 each. All in `LaunchConfig`, script/Deploy.s.sol. |
 | Fees (launch / hard cap) | mint size-tiered by the NAV value of one mint: 1% under $10,000, 0.75% from $10,000, 0.5% from $50,000; every rate capped at 1%, schedule behind the 48h timelock (owner decision 2026-10-13; was a flat 1% / 2% cap). Redeem 1% / 2%, management 3%/yr / 5%/yr (accrued continuously as newly minted index tokens). |
@@ -41,4 +41,6 @@ Addresses verified 2026-10-12 against api.coinbase.com/v1/tokenized-stocks (all 
 ## Known trust assumptions (B20)
 - All 8 tokens share Coinbase blocklist policy 5 on the SENDER, RECEIVER and EXECUTOR scopes. A blocklisted vault or router cannot move that token.
 - The issuer can pause transfers and seize tokens from any holder, including the vault.
-- Base's upcoming Denim upgrade (no date yet) extends the executor check to plain `transfer`.
+- Base's Denim upgrade (mainnet planned November 2026) extends the executor check to plain
+  `transfer`. All 8 stocks use the same blocklist (policy 5) for sender and executor, so nothing
+  changes for the index unless Coinbase changes that (ASSUMPTIONS A-4).

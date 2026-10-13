@@ -20,6 +20,13 @@ interface IB20FactoryView {
     function isB20Initialized(address token) external view returns (bool);
 }
 
+/// @dev Coinbase's TokenSupplyManager (proxy 0xD1Ca...664C on Base): the contract that mints and
+///      redeems Coinbase tokenized stocks. Only its admin can register a token, and every token
+///      on api.coinbase.com/v1/tokenized-stocks is registered (all 135 checked 2026-10-13).
+interface IIssuerRegistry {
+    function isRegisteredToken(address token) external view returns (bool);
+}
+
 interface IOwnedFeed {
     function owner() external view returns (address);
 }
@@ -38,16 +45,17 @@ interface IOwnedFeed {
  *           basket, so choosing or changing a pool is a basket change and waits 48h too.
  *         - Every basket entry is checked when queued AND when executed, so a fake token is
  *           refused even if the Safe queues it:
- *             1. the token is a B20 that Base's B20 factory says it created (`isB20Initialized`);
+ *             1. the token is a B20 that Base's B20 factory says it created (`isB20Initialized`)
+ *                AND Coinbase's own TokenSupplyManager lists it (`isRegisteredToken`). Only
+ *                Coinbase's admin can add to that list, so a copycat "NVDAc" is refused;
  *             2. the feed has the same code (`extcodehash`) and the same owner as the launch
  *                Chainlink feeds (Chainlink's Base multisig; ownership moves only by acceptance);
  *             3. the feed's description is "Coinbase <TICKER>" where the token's symbol is
  *                "<TICKER>c" (Coinbase's naming: NVDAc / "Coinbase NVDA");
  *             4. a token/USDC pool with that tick spacing exists on the Slipstream factory.
- *           What this cannot prove onchain: that the issuer of a B20 is Coinbase. Anyone can
- *           create a B20 called "NVDAc" through the factory. The Safe must check the token address
- *           against api.coinbase.com/v1/tokenized-stocks before queueing; the 48h delay lets
- *           anyone else check too.
+ *           The issuer check trusts Coinbase's register (an upgradeable Coinbase contract). The
+ *           Safe still checks every address against api.coinbase.com/v1/tokenized-stocks before
+ *           queueing, and script/VerifyDeployment.s.sol does the same after deploy.
  *         - Prices: value = raw token balance x feed price. The Coinbase feeds are total-return,
  *           so they already include the B20 dividend multiplier.
  */
@@ -78,6 +86,8 @@ contract BasketRegistry is Settings {
     uint8 public constant SET_MAX_FEED_AGE = 0;
     uint8 public constant SET_TRUSTED_FEED_OWNER = 1;
     uint8 public constant SET_TRUSTED_FEED_CODEHASH = 2;
+    /// @notice Coinbase's token register (48h only, for if Coinbase ever moves it).
+    uint8 public constant SET_ISSUER_REGISTRY = 3;
 
     address public immutable sequencerFeed;
     ISlipstreamFactory public immutable slipstreamFactory;
@@ -97,6 +107,9 @@ contract BasketRegistry is Settings {
     /// @notice Every feed must match the launch feeds' owner and code (see the header).
     address public trustedFeedOwner;
     bytes32 public trustedFeedCodehash;
+    /// @notice Every token must be registered here (Coinbase's TokenSupplyManager).
+    address public issuerRegistry;
+
     event BasketQueued(bytes32 indexed id, AssetConfig[] config, uint256 executableAt);
     event BasketExecuted(AssetConfig[] config);
     event AssetPruned(address indexed token);
@@ -121,6 +134,7 @@ contract BasketRegistry is Settings {
     error NotB20(address token);
     error UntrustedFeed(address feed);
     error FeedDoesNotMatchToken(address token, address feed);
+    error NotCoinbaseIssued(address token);
 
     constructor(
         address owner_,
@@ -128,9 +142,13 @@ contract BasketRegistry is Settings {
         address slipstreamFactory_,
         address usdc_,
         address b20Factory_,
+        address issuerRegistry_,
         AssetConfig[] memory launch
     ) Ownable(owner_) {
-        if (slipstreamFactory_ == address(0) || usdc_ == address(0) || b20Factory_ == address(0)) {
+        if (
+            slipstreamFactory_ == address(0) || usdc_ == address(0) || b20Factory_ == address(0)
+                || issuerRegistry_ == address(0)
+        ) {
             revert ZeroAddress();
         }
         if (launch.length == 0) revert EmptyBasket();
@@ -138,6 +156,7 @@ contract BasketRegistry is Settings {
         slipstreamFactory = ISlipstreamFactory(slipstreamFactory_);
         usdc = usdc_;
         b20Factory = IB20FactoryView(b20Factory_);
+        issuerRegistry = issuerRegistry_;
         _deployer = msg.sender;
         // The first launch feed sets the trusted Chainlink owner and code; every feed must match.
         trustedFeedOwner = IOwnedFeed(launch[0].feed).owner();
@@ -217,7 +236,7 @@ contract BasketRegistry is Settings {
     function _checkSetting(uint8 key, uint256 v) internal pure override {
         if (key == SET_MAX_FEED_AGE) {
             if (v < MIN_FEED_AGE || v > MAX_FEED_AGE) revert FeedAgeOutOfBounds(v);
-        } else if (key == SET_TRUSTED_FEED_OWNER) {
+        } else if (key == SET_TRUSTED_FEED_OWNER || key == SET_ISSUER_REGISTRY) {
             if (v == 0 || v > type(uint160).max) revert ZeroAddress();
         } else if (key != SET_TRUSTED_FEED_CODEHASH) {
             revert UnknownSetting(key);
@@ -228,13 +247,15 @@ contract BasketRegistry is Settings {
         if (key == SET_MAX_FEED_AGE) return maxFeedAge;
         if (key == SET_TRUSTED_FEED_OWNER) return uint160(trustedFeedOwner);
         if (key == SET_TRUSTED_FEED_CODEHASH) return uint256(trustedFeedCodehash);
+        if (key == SET_ISSUER_REGISTRY) return uint160(issuerRegistry);
         revert UnknownSetting(key);
     }
 
     function _applySetting(uint8 key, uint256 v) internal override {
         if (key == SET_MAX_FEED_AGE) maxFeedAge = v;
         else if (key == SET_TRUSTED_FEED_OWNER) trustedFeedOwner = address(uint160(v));
-        else trustedFeedCodehash = bytes32(v);
+        else if (key == SET_TRUSTED_FEED_CODEHASH) trustedFeedCodehash = bytes32(v);
+        else issuerRegistry = address(uint160(v));
     }
 
     /// @dev Only a shorter max feed age is instant (it can only stop cash paths, never price them).
@@ -380,6 +401,7 @@ contract BasketRegistry is Settings {
     /// @dev Checks 1-4 in the header. Any revert inside a call (no such function) also rejects.
     function _checkAuthentic(AssetConfig memory c) internal view {
         if (!b20Factory.isB20Initialized(c.token)) revert NotB20(c.token);
+        if (!IIssuerRegistry(issuerRegistry).isRegisteredToken(c.token)) revert NotCoinbaseIssued(c.token);
         if (c.feed.codehash != trustedFeedCodehash || IOwnedFeed(c.feed).owner() != trustedFeedOwner) {
             revert UntrustedFeed(c.feed);
         }

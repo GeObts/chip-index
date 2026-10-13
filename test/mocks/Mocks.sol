@@ -159,6 +159,15 @@ contract MockB20Factory {
     }
 }
 
+/// @dev Stands in for Coinbase's TokenSupplyManager register (`isRegisteredToken`).
+contract MockIssuerRegistry {
+    mapping(address => bool) public isRegisteredToken;
+
+    function setRegistered(address token, bool b) external {
+        isRegisteredToken[token] = b;
+    }
+}
+
 contract MockWETH is MockERC20 {
     constructor() MockERC20("Wrapped Ether", "WETH", 18) {}
 

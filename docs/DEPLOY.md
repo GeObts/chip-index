@@ -8,9 +8,9 @@ Every launch value is in ONE place: the `LaunchConfig` block at the top of `scri
 | Setting | Value | Status |
 |---|---|---|
 | Name / ticker | "Chip Index" / "CHIPX" | decided (2026-10-13) |
-| Mint cap | 2,500 index tokens (= $25,000 at $10), global; lower instantly, raise after 48h | decided |
+| Mint cap | 5,000 index tokens (= $50,000 at $10), global; lower instantly, raise after 48h | decided 2026-10-13 (was 2,500) |
 | Max USDC per $CHIP buy | $100 (fork: 0.68% vs spot); hard limit $500 | decided |
-| `` buys per 24h | $300 (hard limit $2,000) | proposed 2026-10-13 |
+| $CHIP buys per 24h | $300 (hard limit $2,000) | proposed 2026-10-13 |
 | Rebalance limits | 0.75% per trade; per 24h at most 15% of NAV traded and 0.10% of NAV lost | proposed 2026-10-13 |
 | Safe settings | stricter = instant (`tighten`); looser = 48h (`queueSetting` / `executeSetting`) | decided 2026-10-13 |
 | First mint | $125 × 8 stocks = $1,000 → 100 tokens ($10 each) | decided |
@@ -36,6 +36,31 @@ ends by checking owners, wiring, policy registry, keeper, fees, cap, name/ticker
 Same command plus `--broadcast --account <keystore>`, then verify the source on Basescan.
 The deploy wallet owns nothing afterwards; the Safe owns all five contracts.
 
+## 3a. Verify the live deployment (free, read-only, sends nothing)
+Run this right after the deploy, and again any time you want to confirm nothing has drifted. It
+needs no key. It prints one `PASS` or `FAIL` line per check (150 checks for the launch basket)
+and exits with an error if any line failed.
+
+In WSL, from the repo folder, fill in the five addresses the deploy printed:
+```
+export BASE_RPC_URL=https://mainnet.base.org
+CHIPX_REGISTRY=0x...  CHIPX_VAULT=0x...  CHIPX_REBALANCER=0x...  CHIPX_ROUTER=0x...  CHIPX_SPLITTER=0x...   ~/.foundry/bin/base-forge script script/VerifyDeployment.s.sol --rpc-url $BASE_RPC_URL --ffi
+```
+- `--ffi` lets the script run `curl` to read Coinbase's list (all pages of
+  api.coinbase.com/v1/tokenized-stocks). Nothing else runs outside forge.
+- What it checks: all five owners are the Safe with no ownership transfer pending; the contracts
+  point at each other; the keepers; every fee, cap and limit against `LaunchConfig`; the 48h
+  timelock; **no queued change waiting** on any contract (read onchain from `pendingChanges()`);
+  and for each of the 8 stocks: on Coinbase's live list with the same symbol, a real B20,
+  registered in Coinbase's TokenSupplyManager, its feed named "Coinbase <TICKER>" with Chainlink's
+  owner and code, and its Aerodrome pool.
+- Feed ages are printed as `INFO` (not pass/fail): they are normal up to 24h on weekends.
+- A `FAIL` on a setting the Safe changed on purpose after launch is expected. Update
+  `LaunchConfig` to the new value and run it again.
+- Rehearsed on a Base fork (`test/fork/VerifyDeploymentFork.t.sol`): a clean deploy gives 150
+  PASS and 0 FAIL; a queued change, an unaccepted ownership transfer, a removed keeper and a stock
+  missing from Coinbase's list give exactly 5 FAIL lines.
+
 ## 4. First mint (Safe)
 ```
 VAULT=<IndexVault address> base-forge script script/SafeSeed.s.sol --rpc-url $BASE_RPC_URL
@@ -47,9 +72,11 @@ Downloads, review it, then load it in the Safe app. Rehearsed on the fork: $1,00
 
 ## 5. Ongoing operations
 - A new ticker: the basket entry carries its Aerodrome pool (tick spacing), so one 48h
-  `queueBasket` / `executeBasket` covers it. **Before queueing, match the token address against
-  api.coinbase.com/v1/tokenized-stocks**: the contract checks it is a real B20 with the matching
-  Chainlink feed, but cannot tell who issued it.
+  `queueBasket` / `executeBasket` covers it. **Take the token address from
+  api.coinbase.com/v1/tokenized-stocks.** The contract also refuses any token that Coinbase's
+  TokenSupplyManager (`0xD1Ca…664C`) has not registered, any feed that is not Chainlink's
+  "Coinbase <TICKER>" feed, and any pool that does not exist. After executing, run
+  `VerifyDeployment.s.sol` (it fails until `Addrs.basket()` is updated to the new basket).
 - The keeper sizes each rebalance trade so neither stock crosses its target (the contract refuses
   any trade that does) and runs `rebalancer.eligible()` → `rebalance(...)`, `splitter.redeemFees()` →
   `sellForUsdc(...)` → `buyAndBurn(...)` (at most $100 per call, $300 per 24h).

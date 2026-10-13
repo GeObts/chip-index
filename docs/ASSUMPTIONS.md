@@ -34,9 +34,17 @@ instant (`lib/Settings`). A stock leg that cannot be delivered is credited to `c
 - The issuer can pause transfers per token (`test_fork_pausedToken`) and can seize from any holder,
   the vault included. `sync` writes a seizure down pro-rata for index holders and credit holders
   alike (credits are shares of a per-token pool, so every credit scales at once).
-- Base's upcoming **Denim** upgrade (no date yet) extends the executor check to plain `transfer`.
-  The vault and router are not allowlisted anywhere, so if Coinbase ever switched policy 5 from a
-  blocklist to an allowlist, every contract here would stop moving stock.
+- Base's **Denim** upgrade (official: Sepolia October 21, 2026; mainnet "planning, November
+  2026", docs.base.org/upgrades/denim/overview) applies `TRANSFER_EXECUTOR_POLICY` to plain
+  `transfer` too. Checked onchain 2026-10-13: on all 8 stocks the SENDER, RECEIVER, EXECUTOR and
+  MINT_RECEIVER scopes are all policy 5, a BLOCKLIST (type byte 0, no child policies). For a plain
+  `transfer` the executor is the sender, so Denim asks policy 5 the same question it already asks
+  for the sender: nothing changes for our contracts while they are not blocklisted. It would only
+  matter if Coinbase pointed the executor scope at a different, allowlist-style policy; then every
+  contract here, and every DEX pool, would stop moving stock. Denim also makes a send to the
+  token's own address revert: a redeem to such a receiver is credited, not lost.
+- Seizure needs two steps by Coinbase: the seize-exempt scope is policy 129, a BLOCKLIST run by
+  Coinbase's token admin `0x3846…72B1`; every address is exempt until Coinbase adds it.
 
 ## A-5 Swap venue
 All B20 liquidity is on Aerodrome Slipstream (factory B `0xf8f2eB49…61Ef`, router
@@ -74,10 +82,14 @@ and pause the Router's cash paths (only the Safe unpauses). It cannot touch user
 paths, fees, the basket or ownership. Worst case with a stolen keeper key: REVIEW_RESPONSE §11.
 
 ## A-9 Basket authenticity
-Adding a stock is checked onchain: real B20 (Base's B20 factory), Chainlink feed (same code and
-owner as the launch feeds), feed description `Coinbase <TICKER>` for symbol `<TICKER>c`, and an
-existing pool. Who issued a B20 cannot be checked onchain, so the Safe matches every new token
-address against api.coinbase.com/v1/tokenized-stocks before queueing; the 48h lets others check.
+Adding a stock is checked onchain: real B20 (Base's B20 factory), **registered in Coinbase's
+TokenSupplyManager** (`0xD1Ca…664C`, `isRegisteredToken`; only Coinbase's admin can register, and
+all 145 tokens on Coinbase's list are registered, checked 2026-10-13), Chainlink feed (same code
+and owner as the launch feeds), feed description `Coinbase <TICKER>` for symbol `<TICKER>c`, and an
+existing pool. A copycat B20 with the same name, symbol, policies and even Coinbase's role holders
+is refused (`test_fork_basketRejectsCopycatB20`). The check trusts Coinbase's register (an
+upgradeable Coinbase contract), so the Safe still takes addresses from Coinbase's official list,
+and `script/VerifyDeployment.s.sol` checks them against it after deploy.
 
 ## A-10 Testing
 B20 stocks are precompiles: under stock `forge` their code is the single byte `0xef` and every

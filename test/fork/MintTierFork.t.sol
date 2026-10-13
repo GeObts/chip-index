@@ -19,8 +19,8 @@ import {ChipIndexForkBase} from "./ChipIndexFork.t.sol";
  *         router mint runs: it must succeed when every leg is within 1%, and revert when any is not.
  *
  *         Mint cap: these tests run on the fork base's TEST vault, deployed with a 1,000,000-token
- *         cap, so a $50k mint fits. The launch cap in script/Deploy.s.sol (2,500 tokens = $25k)
- *         is untouched; at launch a $50k mint is impossible until the Safe raises it.
+ *         cap, so a $50k mint fits. The launch cap in script/Deploy.s.sol (5,000 tokens = $50k)
+ *         is untouched; at launch (cap $50k, $1k already seeded) one $50k mint cannot fit.
  */
 contract MintTierForkTest is ChipIndexForkBase {
     uint256 internal constant LIMIT_BPS = 100;
