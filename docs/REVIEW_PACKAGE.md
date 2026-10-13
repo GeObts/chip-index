@@ -206,12 +206,16 @@ weekends.
 ## 8. How to rebuild and re-run everything
 
 The review zip has no `lib/`, `out/`, `cache/` or `.git`, so dependencies are installed first.
-Tested from a clean unzip on Ubuntu (WSL) on 2026-10-13. Needs `git` and `curl`.
+Tested from a clean unzip on Ubuntu (WSL) on 2026-10-13, with a fresh HOME (nothing preinstalled): every
+step below passed. Needs `git` and `curl`.
+
+Forge 1.8.x reports the invariant suite as ONE test with 3 invariants inside it, so the unit count
+reads 103 instead of 105. All 3 invariants still run; the per-invariant lines appear under it.
 
 **1. Foundry (stock) for build, unit and invariant tests.**
 ```
 curl -L https://foundry.paradigm.xyz | bash      # installs foundryup
-foundryup                                        # stock forge/cast/anvil (tested with forge 1.7.1)
+foundryup                                        # stock forge/cast/anvil (tested with forge 1.7.1 and 1.8.5)
 ```
 
 **2. Dependencies, pinned to the exact commits in `foundry.lock`.**
@@ -226,7 +230,7 @@ forge install --no-git \
 **3. Build and unit/invariant tests** (no network needed).
 ```
 forge build --sizes
-forge test --no-match-path "test/fork/*"          # expect 105 passed
+forge test --no-match-path "test/fork/*"          # expect 105 passed (forge 1.7.x) or 103 (forge 1.8.x)
 FOUNDRY_PROFILE=deep forge test --no-match-path "test/fork/*" --match-path "test/invariant/*"   # optional, ~8 min
 ```
 
