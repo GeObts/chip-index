@@ -11,6 +11,7 @@ fs_permissions = [{ access = "read", path = "./test/fork" }]
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "base-std/=lib/base-std/src/",
+    "base-std-test/=lib/base-std/test/",
     "forge-std/=lib/forge-std/src/",
 ]
 
