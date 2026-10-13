@@ -203,6 +203,50 @@ weekends.
    the payer (refund) or a caller-chosen `to` (redeem). Is there any grief or reentrancy path? The
    Router is `nonReentrant` and holds nothing between calls.
 
-## 8. Files to read
-`docs/SPEC.md` (decisions) · `docs/ASSUMPTIONS.md` (trust model) · `docs/DEPLOY.md` (procedure) ·
+## 8. How to rebuild and re-run everything
+
+The review zip has no `lib/`, `out/`, `cache/` or `.git`, so dependencies are installed first.
+Tested from a clean unzip on Ubuntu (WSL) on 2026-10-13. Needs `git` and `curl`.
+
+**1. Foundry (stock) for build, unit and invariant tests.**
+```
+curl -L https://foundry.paradigm.xyz | bash      # installs foundryup
+foundryup                                        # stock forge/cast/anvil (tested with forge 1.7.1)
+```
+
+**2. Dependencies, pinned to the exact commits in `foundry.lock`.**
+```
+cd chip-index
+forge install --no-git \
+  foundry-rs/forge-std@v1.17.0 \
+  OpenZeppelin/openzeppelin-contracts@v5.1.0 \
+  base/base-std@6a249339bdeab7a51a4a6d66819bd3e639032dd5
+```
+
+**3. Build and unit/invariant tests** (no network needed).
+```
+forge build --sizes
+forge test --no-match-path "test/fork/*"          # expect 105 passed
+FOUNDRY_PROFILE=deep forge test --no-match-path "test/fork/*" --match-path "test/invariant/*"   # optional, ~8 min
+```
+
+**4. base-forge for the Base fork tests.** Stock forge cannot run them: a B20 stock is a Base
+precompile, whose code is the single byte `0xef` to stock forge. Base publishes its own Foundry
+build (`base/base-anvil`), installed alongside the stock one:
+```
+foundryup --network base --install v1.1.0
+```
+This adds `~/.foundry/bin/base-forge` (forge with Base precompiles on; base-anvil v1.1.0) and leaves
+the stock `forge` alone. Check it with `~/.foundry/bin/base-forge --version`.
+
+**5. Fork tests** (34, against live Base mainnet state, ~2 minutes).
+```
+export BASE_RPC_URL=https://mainnet.base.org     # or your own Base RPC; the public one works but is slow
+./script/fork-test.sh                             # expect 34 passed
+./script/fork-test.sh --match-contract MintTierForkTest -vv   # the per-stock slippage logs in §6
+```
+Fork results depend on live pool and feed state, so dollar figures will differ slightly from §6.
+
+## 9. Files to read
+`docs/SPEC.md` (decisions) · `docs/ASSUMPTIONS.md` (trust model) · `docs/DEPLOY.md` (procedure) · `docs/MIGRATION.md` (the vault is not upgradeable; how users would move) ·
 `script/Deploy.s.sol` (`LaunchConfig` and `Addrs` blocks hold every launch value and address).
