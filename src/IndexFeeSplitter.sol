@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -14,6 +14,7 @@ import {IChipBurner} from "./interfaces/IExternal.sol";
 import {ISlipstreamRouter} from "./interfaces/ISlipstreamRouter.sol";
 import {IPoolManager, IUnlockCallback, PoolKey, SwapParams} from "./interfaces/IUniswapV4.sol";
 import {OracleLib} from "./lib/OracleLib.sol";
+import {Settings} from "./lib/Settings.sol";
 
 /**
  * @title IndexFeeSplitter
@@ -28,9 +29,14 @@ import {OracleLib} from "./lib/OracleLib.sol";
  *         (USDC -> WETH on Aerodrome, WETH -> $CHIP on the Uniswap v4 pool) and burns it.
  *
  *         $CHIP has no onchain TWAP (its v4 hook keeps no oracle), so the $CHIP leg is protected
- *         by the keeper's `minChipOut` (which may not be 0) plus a per-call size cap (`maxChipBuyUsdc`).
+ *         by the keeper's `minChipOut` (which may not be 0), a per-call size cap (`maxChipBuyUsdc`,
+ *         hard limit $500) and a 24h spend cap (`dailyChipBuyUsdc`, hard limit $2,000).
+ *
+ *         Settings (lib/Settings): SET_KEEPER, SET_MAX_CHIP_BUY, SET_DAILY_CHIP_BUY,
+ *         SET_SELL_SLIPPAGE, SET_ETH_FEED_MAX_AGE (lower is instant, higher is 48h; removing the
+ *         keeper is instant, adding one is 48h) and SET_WETH_USDC_TICK_SPACING (48h only).
  */
-contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
+contract IndexFeeSplitter is Settings, ReentrancyGuard, IUnlockCallback {
     using SafeERC20 for IERC20;
 
     struct Config {
@@ -48,11 +54,23 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         int24 wethUsdcTickSpacing;
         address keeper;
         uint256 maxChipBuyUsdc;
+        uint256 dailyChipBuyUsdc;
     }
 
     uint256 public constant BPS = 10_000;
     uint256 public constant POT_SHARE_BPS = 5_000; // 50% to the Pot, 50% to buy-and-burn
     uint16 public constant MAX_SELL_SLIPPAGE_BPS = 200;
+    uint256 public constant MAX_CHIP_BUY_LIMIT = 500e6; // hard limit per buyAndBurn call
+    uint256 public constant DAILY_CHIP_BUY_LIMIT = 2_000e6; // hard limit per 24h
+    uint256 public constant MIN_ETH_FEED_AGE = 5 minutes;
+    uint256 public constant MAX_ETH_FEED_AGE = 24 hours;
+
+    uint8 public constant SET_KEEPER = 0;
+    uint8 public constant SET_MAX_CHIP_BUY = 1;
+    uint8 public constant SET_DAILY_CHIP_BUY = 2;
+    uint8 public constant SET_SELL_SLIPPAGE = 3;
+    uint8 public constant SET_ETH_FEED_MAX_AGE = 4;
+    uint8 public constant SET_WETH_USDC_TICK_SPACING = 5;
     /// @dev TickMath.MIN_SQRT_PRICE + 1 / MAX_SQRT_PRICE - 1.
     uint160 internal constant MIN_SQRT_PRICE_LIMIT = 4295128740;
     uint160 internal constant MAX_SQRT_PRICE_LIMIT = 1461446703485210103287273052203988822378723970341;
@@ -82,6 +100,10 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     uint16 public sellSlippageBps = 100;
     uint256 public ethFeedMaxAge = 1 hours;
     uint256 public maxChipBuyUsdc;
+    /// @notice Most USDC `buyAndBurn` may spend per 24h window, and the current window.
+    uint256 public dailyChipBuyUsdc;
+    uint64 public chipWindowStart;
+    uint256 public chipWindowSpent;
     /// @notice USDC set aside for $CHIP buys (the non-Pot half of everything distributed).
     uint256 public chipBudget;
 
@@ -89,11 +111,6 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     event SoldForUsdc(address indexed token, uint256 amountIn, uint256 usdcOut);
     event Distributed(uint256 toPot, uint256 toChipBudget);
     event ChipBoughtAndBurned(uint256 usdcIn, uint256 wethIn, uint256 chipOut);
-    event KeeperSet(address keeper);
-    event MaxChipBuySet(uint256 maxUsdc);
-    event SellSlippageSet(uint16 bps);
-    event EthFeedMaxAgeSet(uint256 maxAge);
-    event WethUsdcTickSpacingSet(int24 tickSpacing);
     event Swept(address indexed token, address to, uint256 amount);
 
     error ZeroAddress();
@@ -104,6 +121,7 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     error NotListed(address token);
     error OverBudget(uint256 usdcIn, uint256 budget);
     error OverCap(uint256 usdcIn, uint256 cap);
+    error OverDailyCap(uint256 spentToday, uint256 cap);
     error ChipOutBelowMin(uint256 out, uint256 min);
     error ZeroMinChipOut();
     error PartialFill(uint256 paid, uint256 wanted);
@@ -141,8 +159,12 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         _hooks = k.hooks;
 
         keeper = c.keeper;
+        if (c.maxChipBuyUsdc > MAX_CHIP_BUY_LIMIT) revert OverCap(c.maxChipBuyUsdc, MAX_CHIP_BUY_LIMIT);
+        if (c.dailyChipBuyUsdc > DAILY_CHIP_BUY_LIMIT) revert OverDailyCap(c.dailyChipBuyUsdc, DAILY_CHIP_BUY_LIMIT);
         maxChipBuyUsdc = c.maxChipBuyUsdc;
-        _setWethUsdcTickSpacing(c.wethUsdcTickSpacing);
+        dailyChipBuyUsdc = c.dailyChipBuyUsdc;
+        _requirePool(uint24(c.wethUsdcTickSpacing));
+        wethUsdcTickSpacing = c.wethUsdcTickSpacing;
     }
 
     modifier onlyKeeper() {
@@ -216,7 +238,13 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         if (minChipOut == 0) revert ZeroMinChipOut();
         if (usdcIn > chipBudget) revert OverBudget(usdcIn, chipBudget);
         if (usdcIn > maxChipBuyUsdc) revert OverCap(usdcIn, maxChipBuyUsdc);
-        chipBudget -= usdcIn;
+        if (block.timestamp >= uint256(chipWindowStart) + 1 days) {
+            chipWindowStart = uint64(block.timestamp);
+            chipWindowSpent = 0;
+        }
+        uint256 spent = chipWindowSpent + usdcIn;
+        if (spent > dailyChipBuyUsdc) revert OverDailyCap(spent, dailyChipBuyUsdc);
+        chipWindowSpent = spent;        chipBudget -= usdcIn;
 
         // 1. USDC -> WETH on Aerodrome, within sellSlippageBps of Chainlink ETH/USD.
         OracleLib.checkSequencer(registry.sequencerFeed());
@@ -287,31 +315,6 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     /*                              Owner                                  */
     /* ------------------------------------------------------------------ */
 
-    function setKeeper(address keeper_) external onlyOwner {
-        keeper = keeper_;
-        emit KeeperSet(keeper_);
-    }
-
-    function setMaxChipBuyUsdc(uint256 maxUsdc) external onlyOwner {
-        maxChipBuyUsdc = maxUsdc;
-        emit MaxChipBuySet(maxUsdc);
-    }
-
-    function setSellSlippageBps(uint16 bps) external onlyOwner {
-        if (bps > MAX_SELL_SLIPPAGE_BPS) revert SlippageAboveCap(bps);
-        sellSlippageBps = bps;
-        emit SellSlippageSet(bps);
-    }
-
-    function setEthFeedMaxAge(uint256 maxAge) external onlyOwner {
-        if (maxAge < 5 minutes || maxAge > 24 hours) revert FeedAgeOutOfBounds(maxAge);
-        ethFeedMaxAge = maxAge;
-        emit EthFeedMaxAgeSet(maxAge);
-    }
-
-    function setWethUsdcTickSpacing(int24 tickSpacing) external onlyOwner {
-        _setWethUsdcTickSpacing(tickSpacing);
-    }
 
     /// @notice Recover a token that is NOT part of the fee flow (sent by mistake, or a stock that
     ///         was delisted and has no price any more). USDC, WETH, $CHIP, the index token and
@@ -342,11 +345,58 @@ contract IndexFeeSplitter is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         emit Distributed(toPot, toChip);
     }
 
-    function _setWethUsdcTickSpacing(int24 tickSpacing) internal {
-        if (registry.slipstreamFactory().getPool(address(weth), address(usdc), tickSpacing) == address(0)) {
+    function _requirePool(uint256 v) internal view {
+        int24 tickSpacing = int24(uint24(v));
+        if (v > type(uint24).max || registry.slipstreamFactory().getPool(address(weth), address(usdc), tickSpacing) == address(0)) {
             revert NoSuchPool(tickSpacing);
         }
-        wethUsdcTickSpacing = tickSpacing;
-        emit WethUsdcTickSpacingSet(tickSpacing);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*                        Settings (lib/Settings)                      */
+    /* ------------------------------------------------------------------ */
+
+    function _checkSetting(uint8 key, uint256 v) internal view override {
+        if (key == SET_KEEPER) {
+            if (v > type(uint160).max) revert ZeroAddress();
+        } else if (key == SET_MAX_CHIP_BUY) {
+            if (v > MAX_CHIP_BUY_LIMIT) revert OverCap(v, MAX_CHIP_BUY_LIMIT);
+        } else if (key == SET_DAILY_CHIP_BUY) {
+            if (v > DAILY_CHIP_BUY_LIMIT) revert OverDailyCap(v, DAILY_CHIP_BUY_LIMIT);
+        } else if (key == SET_SELL_SLIPPAGE) {
+            if (v > MAX_SELL_SLIPPAGE_BPS) revert SlippageAboveCap(uint16(v));
+        } else if (key == SET_ETH_FEED_MAX_AGE) {
+            if (v < MIN_ETH_FEED_AGE || v > MAX_ETH_FEED_AGE) revert FeedAgeOutOfBounds(v);
+        } else if (key == SET_WETH_USDC_TICK_SPACING) {
+            _requirePool(v);
+        } else {
+            revert UnknownSetting(key);
+        }
+    }
+
+    function _getSetting(uint8 key) internal view override returns (uint256) {
+        if (key == SET_KEEPER) return uint160(keeper);
+        if (key == SET_MAX_CHIP_BUY) return maxChipBuyUsdc;
+        if (key == SET_DAILY_CHIP_BUY) return dailyChipBuyUsdc;
+        if (key == SET_SELL_SLIPPAGE) return sellSlippageBps;
+        if (key == SET_ETH_FEED_MAX_AGE) return ethFeedMaxAge;
+        if (key == SET_WETH_USDC_TICK_SPACING) return uint24(wethUsdcTickSpacing);
+        revert UnknownSetting(key);
+    }
+
+    function _applySetting(uint8 key, uint256 v) internal override {
+        if (key == SET_KEEPER) keeper = address(uint160(v));
+        else if (key == SET_MAX_CHIP_BUY) maxChipBuyUsdc = v;
+        else if (key == SET_DAILY_CHIP_BUY) dailyChipBuyUsdc = v;
+        else if (key == SET_SELL_SLIPPAGE) sellSlippageBps = uint16(v);
+        else if (key == SET_ETH_FEED_MAX_AGE) ethFeedMaxAge = v;
+        else wethUsdcTickSpacing = int24(uint24(v));
+    }
+
+    /// @dev Keeper: only removal is instant. Pool: never instant. Others: lower is tighter.
+    function _isTightening(uint8 key, uint256 v) internal view override returns (bool) {
+        if (key == SET_KEEPER) return v == 0;
+        if (key == SET_WETH_USDC_TICK_SPACING) return false;
+        return v <= _getSetting(key);
     }
 }

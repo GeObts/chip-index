@@ -1,18 +1,27 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
 import {ISlipstreamFactory} from "./interfaces/ISlipstreamRouter.sol";
 import {OracleLib} from "./lib/OracleLib.sol";
-import {Timelock} from "./lib/Timelock.sol";
+import {Settings} from "./lib/Settings.sol";
 
 interface IHoldings {
     function held(address token) external view returns (uint256);
     function totalOwed(address token) external view returns (uint256);
+}
+
+/// @dev Base's B20 factory precompile (0xB20f...0000): the only trusted answer to "is this a B20?".
+interface IB20FactoryView {
+    function isB20Initialized(address token) external view returns (bool);
+}
+
+interface IOwnedFeed {
+    function owner() external view returns (address);
 }
 
 /**
@@ -25,10 +34,24 @@ interface IHoldings {
  *         - A token dropped from the basket while the vault still holds it, or still owes credits
  *           in it, stays listed at weight 0, so holders can always redeem it. The Rebalancer
  *           sells it down and anyone can then `prune` it once the vault holds and owes none.
+ *         - The pool each token trades in (its Aerodrome token/USDC tick spacing) is part of the
+ *           basket, so choosing or changing a pool is a basket change and waits 48h too.
+ *         - Every basket entry is checked when queued AND when executed, so a fake token is
+ *           refused even if the Safe queues it:
+ *             1. the token is a B20 that Base's B20 factory says it created (`isB20Initialized`);
+ *             2. the feed has the same code (`extcodehash`) and the same owner as the launch
+ *                Chainlink feeds (Chainlink's Base multisig; ownership moves only by acceptance);
+ *             3. the feed's description is "Coinbase <TICKER>" where the token's symbol is
+ *                "<TICKER>c" (Coinbase's naming: NVDAc / "Coinbase NVDA");
+ *             4. a token/USDC pool with that tick spacing exists on the Slipstream factory.
+ *           What this cannot prove onchain: that the issuer of a B20 is Coinbase. Anyone can
+ *           create a B20 called "NVDAc" through the factory. The Safe must check the token address
+ *           against api.coinbase.com/v1/tokenized-stocks before queueing; the 48h delay lets
+ *           anyone else check too.
  *         - Prices: value = raw token balance x feed price. The Coinbase feeds are total-return,
  *           so they already include the B20 dividend multiplier.
  */
-contract BasketRegistry is Ownable2Step, Timelock {
+contract BasketRegistry is Settings {
     struct Asset {
         address token;
         address feed;
@@ -41,6 +64,7 @@ contract BasketRegistry is Ownable2Step, Timelock {
         address token;
         address feed;
         uint16 weightBps;
+        int24 usdcTickSpacing;
     }
 
     uint256 public constant BPS = 10_000;
@@ -49,9 +73,16 @@ contract BasketRegistry is Ownable2Step, Timelock {
     uint256 public constant MAX_FEED_AGE = 72 hours;
     bytes32 public constant ACTION_BASKET = keccak256("BASKET");
 
+    /// @notice Setting keys (lib/Settings). Max feed age: lower is instant, higher is 48h. The
+    ///         trusted feed owner and code hash: 48h only (for when Chainlink migrates its feeds).
+    uint8 public constant SET_MAX_FEED_AGE = 0;
+    uint8 public constant SET_TRUSTED_FEED_OWNER = 1;
+    uint8 public constant SET_TRUSTED_FEED_CODEHASH = 2;
+
     address public immutable sequencerFeed;
     ISlipstreamFactory public immutable slipstreamFactory;
     address public immutable usdc;
+    IB20FactoryView public immutable b20Factory;
     address private immutable _deployer;
 
     Asset[] internal _assets;
@@ -63,11 +94,12 @@ contract BasketRegistry is Ownable2Step, Timelock {
     uint256 public maxFeedAge = 26 hours;
     /// @notice Aerodrome Slipstream tick spacing of each token's token/USDC pool.
     mapping(address token => int24) public usdcTickSpacing;
-
+    /// @notice Every feed must match the launch feeds' owner and code (see the header).
+    address public trustedFeedOwner;
+    bytes32 public trustedFeedCodehash;
     event BasketQueued(bytes32 indexed id, AssetConfig[] config, uint256 executableAt);
     event BasketExecuted(AssetConfig[] config);
     event AssetPruned(address indexed token);
-    event MaxFeedAgeSet(uint256 maxFeedAge);
     event UsdcTickSpacingSet(address indexed token, int24 tickSpacing);
     event VaultWired(address vault);
 
@@ -86,26 +118,32 @@ contract BasketRegistry is Ownable2Step, Timelock {
     error NotDeployer();
     error LengthMismatch();
     error AlreadyWired();
+    error NotB20(address token);
+    error UntrustedFeed(address feed);
+    error FeedDoesNotMatchToken(address token, address feed);
 
     constructor(
         address owner_,
         address sequencerFeed_,
         address slipstreamFactory_,
         address usdc_,
-        AssetConfig[] memory launch,
-        int24[] memory launchTickSpacings
+        address b20Factory_,
+        AssetConfig[] memory launch
     ) Ownable(owner_) {
-        if (slipstreamFactory_ == address(0) || usdc_ == address(0)) revert ZeroAddress();
+        if (slipstreamFactory_ == address(0) || usdc_ == address(0) || b20Factory_ == address(0)) {
+            revert ZeroAddress();
+        }
+        if (launch.length == 0) revert EmptyBasket();
         sequencerFeed = sequencerFeed_;
         slipstreamFactory = ISlipstreamFactory(slipstreamFactory_);
         usdc = usdc_;
+        b20Factory = IB20FactoryView(b20Factory_);
         _deployer = msg.sender;
+        // The first launch feed sets the trusted Chainlink owner and code; every feed must match.
+        trustedFeedOwner = IOwnedFeed(launch[0].feed).owner();
+        trustedFeedCodehash = launch[0].feed.codehash;
         _validate(launch);
         _install(launch);
-        if (launchTickSpacings.length != launch.length) revert LengthMismatch();
-        for (uint256 i; i < launch.length; ++i) {
-            _setTickSpacing(launch[i].token, launchTickSpacings[i]);
-        }
         emit BasketExecuted(launch);
     }
 
@@ -176,16 +214,32 @@ contract BasketRegistry is Ownable2Step, Timelock {
     /*                      Operational settings                           */
     /* ------------------------------------------------------------------ */
 
-    function setMaxFeedAge(uint256 maxFeedAge_) external onlyOwner {
-        if (maxFeedAge_ < MIN_FEED_AGE || maxFeedAge_ > MAX_FEED_AGE) revert FeedAgeOutOfBounds(maxFeedAge_);
-        maxFeedAge = maxFeedAge_;
-        emit MaxFeedAgeSet(maxFeedAge_);
+    function _checkSetting(uint8 key, uint256 v) internal pure override {
+        if (key == SET_MAX_FEED_AGE) {
+            if (v < MIN_FEED_AGE || v > MAX_FEED_AGE) revert FeedAgeOutOfBounds(v);
+        } else if (key == SET_TRUSTED_FEED_OWNER) {
+            if (v == 0 || v > type(uint160).max) revert ZeroAddress();
+        } else if (key != SET_TRUSTED_FEED_CODEHASH) {
+            revert UnknownSetting(key);
+        }
     }
 
-    /// @notice Point a token at a different Aerodrome token/USDC pool. Immediate: a bad pool only
-    ///         makes slippage-checked trades fail, it cannot move funds.
-    function setUsdcTickSpacing(address token, int24 tickSpacing) external onlyOwner {
-        _setTickSpacing(token, tickSpacing);
+    function _getSetting(uint8 key) internal view override returns (uint256) {
+        if (key == SET_MAX_FEED_AGE) return maxFeedAge;
+        if (key == SET_TRUSTED_FEED_OWNER) return uint160(trustedFeedOwner);
+        if (key == SET_TRUSTED_FEED_CODEHASH) return uint256(trustedFeedCodehash);
+        revert UnknownSetting(key);
+    }
+
+    function _applySetting(uint8 key, uint256 v) internal override {
+        if (key == SET_MAX_FEED_AGE) maxFeedAge = v;
+        else if (key == SET_TRUSTED_FEED_OWNER) trustedFeedOwner = address(uint160(v));
+        else trustedFeedCodehash = bytes32(v);
+    }
+
+    /// @dev Only a shorter max feed age is instant (it can only stop cash paths, never price them).
+    function _isTightening(uint8 key, uint256 v) internal view override returns (bool) {
+        return key == SET_MAX_FEED_AGE && v <= maxFeedAge;
     }
 
     /* ------------------------------------------------------------------ */
@@ -287,6 +341,7 @@ contract BasketRegistry is Ownable2Step, Timelock {
             if (td > 18) revert BadDecimals(c.token, td);
             uint8 fd = IAggregatorV3(c.feed).decimals();
             if (fd > 18) revert BadDecimals(c.feed, fd);
+            _checkAuthentic(c);
             sum += c.weightBps;
         }
         if (sum != BPS) revert WeightsMustSum(sum);
@@ -304,6 +359,8 @@ contract BasketRegistry is Ownable2Step, Timelock {
                     feedDecimals: IAggregatorV3(c.feed).decimals()
                 })
             );
+            usdcTickSpacing[c.token] = c.usdcTickSpacing;
+            emit UsdcTickSpacingSet(c.token, c.usdcTickSpacing);
         }
     }
 
@@ -320,9 +377,24 @@ contract BasketRegistry is Ownable2Step, Timelock {
         delete _assets;
     }
 
-    function _setTickSpacing(address token, int24 tickSpacing) internal {
-        if (slipstreamFactory.getPool(token, usdc, tickSpacing) == address(0)) revert NoSuchPool(token, tickSpacing);
-        usdcTickSpacing[token] = tickSpacing;
-        emit UsdcTickSpacingSet(token, tickSpacing);
+    /// @dev Checks 1-4 in the header. Any revert inside a call (no such function) also rejects.
+    function _checkAuthentic(AssetConfig memory c) internal view {
+        if (!b20Factory.isB20Initialized(c.token)) revert NotB20(c.token);
+        if (c.feed.codehash != trustedFeedCodehash || IOwnedFeed(c.feed).owner() != trustedFeedOwner) {
+            revert UntrustedFeed(c.feed);
+        }
+        bytes memory sym = bytes(IERC20Metadata(c.token).symbol());
+        uint256 n = sym.length;
+        if (n < 2 || sym[n - 1] != "c") revert FeedDoesNotMatchToken(c.token, c.feed);
+        bytes memory ticker = new bytes(n - 1);
+        for (uint256 i; i < n - 1; ++i) {
+            ticker[i] = sym[i];
+        }
+        if (keccak256(bytes(IAggregatorV3(c.feed).description())) != keccak256(abi.encodePacked("Coinbase ", ticker))) {
+            revert FeedDoesNotMatchToken(c.token, c.feed);
+        }
+        if (slipstreamFactory.getPool(c.token, usdc, c.usdcTickSpacing) == address(0)) {
+            revert NoSuchPool(c.token, c.usdcTickSpacing);
+        }
     }
 }

@@ -5,6 +5,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {BasketRegistry} from "../../src/BasketRegistry.sol";
 import {OracleLib} from "../../src/lib/OracleLib.sol";
+import {Settings} from "../../src/lib/Settings.sol";
 import {Timelock} from "../../src/lib/Timelock.sol";
 import {Fixture} from "../Fixture.sol";
 import {MockAggregator, MockB20} from "../mocks/Mocks.sol";
@@ -113,9 +114,11 @@ contract BasketRegistryTest is Fixture {
         MockB20 coin = new MockB20("COIN", "COINc", policies, 99);
         MockAggregator coinFeed = new MockAggregator(8, 300e8);
         factory.setPool(address(coin), address(usdc), TS);
+        b20Factory.setB20(address(coin), true);
+        coinFeed.setDescription("Coinbase COIN");
 
         BasketRegistry.AssetConfig[] memory cfg = _basket();
-        cfg[7] = BasketRegistry.AssetConfig(address(coin), address(coinFeed), 1_250); // MSFT -> COIN
+        cfg[7] = BasketRegistry.AssetConfig(address(coin), address(coinFeed), 1_250, TS); // MSFT -> COIN
         vm.prank(safe);
         registry.queueBasket(cfg);
         vm.warp(block.timestamp + 48 hours);
@@ -241,21 +244,145 @@ contract BasketRegistryTest is Fixture {
         registry.priceUsd(address(stocks[0]));
     }
 
-    function test_maxFeedAgeBounds() public {
+    /// Shorter max feed age is instant (it only stops cash paths); longer waits 48h.
+    function test_maxFeedAge_shorterInstantLongerTimelocked() public {
+        uint8 k = registry.SET_MAX_FEED_AGE();
         vm.startPrank(safe);
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.FeedAgeOutOfBounds.selector, 59 minutes));
+        registry.tighten(k, 59 minutes);
+        registry.tighten(k, 2 hours);
+        assertEq(registry.maxFeedAge(), 2 hours);
+
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, k, 72 hours));
+        registry.tighten(k, 72 hours);
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.FeedAgeOutOfBounds.selector, 72 hours + 1));
+        registry.queueSetting(k, 72 hours + 1);
+        registry.queueSetting(k, 72 hours);
         vm.expectRevert();
-        registry.setMaxFeedAge(59 minutes);
-        vm.expectRevert();
-        registry.setMaxFeedAge(72 hours + 1);
-        registry.setMaxFeedAge(72 hours);
+        registry.executeSetting(k, 72 hours);
+        vm.warp(block.timestamp + 48 hours);
+        registry.executeSetting(k, 72 hours);
         vm.stopPrank();
         assertEq(registry.maxFeedAge(), 72 hours);
     }
 
-    function test_tickSpacingNeedsRealPool() public {
+    /// The pool is part of the basket: a new pool waits 48h and must exist on the factory.
+    function test_poolChangeIsABasketChange() public {
+        BasketRegistry.AssetConfig[] memory cfg = _basket();
+        cfg[0].usdcTickSpacing = 50;
         vm.prank(safe);
         vm.expectRevert(abi.encodeWithSelector(BasketRegistry.NoSuchPool.selector, address(stocks[0]), int24(50)));
-        registry.setUsdcTickSpacing(address(stocks[0]), 50);
+        registry.queueBasket(cfg);
+
+        factory.setPool(address(stocks[0]), address(usdc), 50);
+        vm.prank(safe);
+        registry.queueBasket(cfg);
+        assertEq(registry.usdcTickSpacing(address(stocks[0])), TS, "unchanged until executed");
+        vm.warp(block.timestamp + 48 hours);
+        _freshFeeds();
+        vm.prank(safe);
+        registry.executeBasket(cfg);
+        assertEq(registry.usdcTickSpacing(address(stocks[0])), 50);
+    }
+
+    /* ------------------------- authenticity -------------------------- */
+
+    function _queueWithLast(address token, address feed) internal {
+        BasketRegistry.AssetConfig[] memory cfg = _basket();
+        cfg[7] = BasketRegistry.AssetConfig(token, feed, 1_250, TS);
+        vm.prank(safe);
+        registry.queueBasket(cfg);
+    }
+
+    function _newFeed(string memory desc) internal returns (MockAggregator f) {
+        f = new MockAggregator(8, 300e8);
+        f.setDescription(desc);
+    }
+
+    function _newStock(string memory symbol, bool isB20) internal returns (MockB20 t) {
+        t = new MockB20(symbol, symbol, policies, 99);
+        factory.setPool(address(t), address(usdc), TS);
+        b20Factory.setB20(address(t), isB20);
+    }
+
+    /// A plain ERC-20 (not created by Base's B20 factory) is refused, even when the Safe queues it.
+    function test_authenticity_fakeTokenRejected() public {
+        MockB20 fake = _newStock("COINc", false);
+        address feed = address(_newFeed("Coinbase COIN"));
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.NotB20.selector, address(fake)));
+        this.queueWithLast(address(fake), feed);
+    }
+
+    /// A feed that is not one of Chainlink's (different code, or a different owner) is refused.
+    function test_authenticity_untrustedFeedRejected() public {
+        MockB20 coin = _newStock("COINc", true);
+        MockAggregator f = _newFeed("Coinbase COIN");
+        f.setOwner(alice);
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.UntrustedFeed.selector, address(f)));
+        this.queueWithLast(address(coin), address(f));
+
+        // Same owner but different code: a look-alike contract.
+        LookAlikeFeed look = new LookAlikeFeed(address(this));
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.UntrustedFeed.selector, address(look)));
+        this.queueWithLast(address(coin), address(look));
+    }
+
+    /// The feed must be "Coinbase <TICKER>" for a token whose symbol is "<TICKER>c".
+    function test_authenticity_feedMustMatchTicker() public {
+        MockB20 coin = _newStock("COINc", true);
+        // NVDA's real feed paired with a COIN token.
+        vm.expectRevert(
+            abi.encodeWithSelector(BasketRegistry.FeedDoesNotMatchToken.selector, address(coin), address(feeds[0]))
+        );
+        this.queueWithLast(address(coin), address(feeds[0]));
+
+        // A symbol that does not follow Coinbase's "<TICKER>c" naming.
+        MockB20 odd = _newStock("COIN", true);
+        address feed = address(_newFeed("Coinbase COI"));
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.FeedDoesNotMatchToken.selector, address(odd), feed));
+        this.queueWithLast(address(odd), feed);
+
+        // The right pairing is accepted.
+        this.queueWithLast(address(coin), address(_newFeed("Coinbase COIN")));
+    }
+
+    /// Checked again at execute: a token that stops passing during the 48h is refused then.
+    function test_authenticity_recheckedAtExecute() public {
+        MockB20 coin = _newStock("COINc", true);
+        MockAggregator f = _newFeed("Coinbase COIN");
+        BasketRegistry.AssetConfig[] memory cfg = _basket();
+        cfg[7] = BasketRegistry.AssetConfig(address(coin), address(f), 1_250, TS);
+        vm.prank(safe);
+        registry.queueBasket(cfg);
+        f.setDescription("Coinbase NVDA");
+        vm.warp(block.timestamp + 48 hours);
+        _freshFeeds();
+        vm.prank(safe);
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.FeedDoesNotMatchToken.selector, address(coin), address(f)));
+        registry.executeBasket(cfg);
+    }
+
+    /// The trusted feed owner can only change through the 48h timelock (for a Chainlink migration).
+    function test_trustedFeedOwner_timelockOnly() public {
+        uint8 k = registry.SET_TRUSTED_FEED_OWNER();
+        vm.startPrank(safe);
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, k, uint256(uint160(alice))));
+        registry.tighten(k, uint160(alice));
+        registry.queueSetting(k, uint160(alice));
+        vm.warp(block.timestamp + 48 hours);
+        registry.executeSetting(k, uint160(alice));
+        vm.stopPrank();
+        assertEq(registry.trustedFeedOwner(), alice);
+    }
+
+    function queueWithLast(address token, address feed) external {
+        _queueWithLast(token, feed);
+    }
+
+    function _freshFeeds() internal {
+        for (uint256 i; i < N; ++i) {
+            feeds[i].setUpdatedAt(block.timestamp);
+        }
     }
 
     function test_wireOnlyOnceByDeployer() public {
@@ -264,5 +391,22 @@ contract BasketRegistryTest is Fixture {
         vm.prank(safe);
         vm.expectRevert(BasketRegistry.NotDeployer.selector);
         registry.wireVault(address(1));
+    }
+}
+
+/// @notice Same answers as a Chainlink proxy, different code.
+contract LookAlikeFeed {
+    address public owner;
+
+    constructor(address o) {
+        owner = o;
+    }
+
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    function description() external pure returns (string memory) {
+        return "Coinbase COIN";
     }
 }

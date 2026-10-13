@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -13,6 +13,7 @@ import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
 import {IWETH} from "./interfaces/IExternal.sol";
 import {ISlipstreamRouter} from "./interfaces/ISlipstreamRouter.sol";
 import {OracleLib} from "./lib/OracleLib.sol";
+import {Settings} from "./lib/Settings.sol";
 
 /**
  * @title IndexRouter
@@ -29,14 +30,24 @@ import {OracleLib} from "./lib/OracleLib.sol";
  *         Cash redeems refuse issuer-blocklisted callers and recipients (see IndexVault BLOCKLIST).
  *
  *         Assumes 1 USDC = $1 when comparing USDC against the stock feeds.
+ *
+ *         Settings (lib/Settings): SET_KEEPER, SET_LEG_SLIPPAGE, SET_ETH_FEED_MAX_AGE (lower is
+ *         instant, higher is 48h; removing the keeper is instant, adding one is 48h) and
+ *         SET_WETH_USDC_TICK_SPACING (pool choice: 48h only). Pausing (owner or keeper) and
+ *         unpausing (owner) stay instant.
  */
-contract IndexRouter is Ownable2Step, ReentrancyGuard {
+contract IndexRouter is Settings, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 public constant BPS = 10_000;
     uint16 public constant MAX_LEG_SLIPPAGE_BPS = 100; // 1%
     uint256 public constant MIN_ETH_FEED_AGE = 5 minutes;
     uint256 public constant MAX_ETH_FEED_AGE = 24 hours;
+
+    uint8 public constant SET_KEEPER = 0;
+    uint8 public constant SET_LEG_SLIPPAGE = 1;
+    uint8 public constant SET_ETH_FEED_MAX_AGE = 2;
+    uint8 public constant SET_WETH_USDC_TICK_SPACING = 3;
 
     IndexVault public immutable vault;
     BasketRegistry public immutable registry;
@@ -59,10 +70,6 @@ contract IndexRouter is Ownable2Step, ReentrancyGuard {
     event RedeemedToEth(address indexed user, address indexed to, uint256 shares, uint256 ethOut);
     event CashMintPausedSet(bool paused, address by);
     event CashRedeemPausedSet(bool paused, address by);
-    event KeeperSet(address keeper);
-    event LegSlippageSet(uint16 bps);
-    event EthFeedMaxAgeSet(uint256 maxAge);
-    event WethUsdcTickSpacingSet(int24 tickSpacing);
     event EthPaidAsWeth(address indexed to, uint256 amount);
 
     error ZeroAddress();
@@ -99,7 +106,8 @@ contract IndexRouter is Ownable2Step, ReentrancyGuard {
         ethUsdFeed = ethUsdFeed_;
         _ethFeedDecimals = IAggregatorV3(ethUsdFeed_).decimals();
         keeper = keeper_;
-        _setWethUsdcTickSpacing(wethUsdcTickSpacing_);
+        _requirePool(uint24(wethUsdcTickSpacing_));
+        wethUsdcTickSpacing = wethUsdcTickSpacing_;
     }
 
     receive() external payable {
@@ -287,25 +295,44 @@ contract IndexRouter is Ownable2Step, ReentrancyGuard {
         emit CashRedeemPausedSet(false, msg.sender);
     }
 
-    function setKeeper(address keeper_) external onlyOwner {
-        keeper = keeper_;
-        emit KeeperSet(keeper_);
+    /* ------------------------------------------------------------------ */
+    /*                        Settings (lib/Settings)                      */
+    /* ------------------------------------------------------------------ */
+
+    function _checkSetting(uint8 key, uint256 v) internal view override {
+        if (key == SET_KEEPER) {
+            if (v > type(uint160).max) revert ZeroAddress();
+        } else if (key == SET_LEG_SLIPPAGE) {
+            if (v > MAX_LEG_SLIPPAGE_BPS) revert SlippageAboveCap(uint16(v));
+        } else if (key == SET_ETH_FEED_MAX_AGE) {
+            if (v < MIN_ETH_FEED_AGE || v > MAX_ETH_FEED_AGE) revert FeedAgeOutOfBounds(v);
+        } else if (key == SET_WETH_USDC_TICK_SPACING) {
+            _requirePool(v);
+        } else {
+            revert UnknownSetting(key);
+        }
     }
 
-    function setLegSlippageBps(uint16 bps) external onlyOwner {
-        if (bps > MAX_LEG_SLIPPAGE_BPS) revert SlippageAboveCap(bps);
-        legSlippageBps = bps;
-        emit LegSlippageSet(bps);
+    function _getSetting(uint8 key) internal view override returns (uint256) {
+        if (key == SET_KEEPER) return uint160(keeper);
+        if (key == SET_LEG_SLIPPAGE) return legSlippageBps;
+        if (key == SET_ETH_FEED_MAX_AGE) return ethFeedMaxAge;
+        if (key == SET_WETH_USDC_TICK_SPACING) return uint24(wethUsdcTickSpacing);
+        revert UnknownSetting(key);
     }
 
-    function setEthFeedMaxAge(uint256 maxAge) external onlyOwner {
-        if (maxAge < MIN_ETH_FEED_AGE || maxAge > MAX_ETH_FEED_AGE) revert FeedAgeOutOfBounds(maxAge);
-        ethFeedMaxAge = maxAge;
-        emit EthFeedMaxAgeSet(maxAge);
+    function _applySetting(uint8 key, uint256 v) internal override {
+        if (key == SET_KEEPER) keeper = address(uint160(v));
+        else if (key == SET_LEG_SLIPPAGE) legSlippageBps = uint16(v);
+        else if (key == SET_ETH_FEED_MAX_AGE) ethFeedMaxAge = v;
+        else wethUsdcTickSpacing = int24(uint24(v));
     }
 
-    function setWethUsdcTickSpacing(int24 tickSpacing) external onlyOwner {
-        _setWethUsdcTickSpacing(tickSpacing);
+    /// @dev Keeper: only removal is instant. Pool: never instant. Others: lower is tighter.
+    function _isTightening(uint8 key, uint256 v) internal view override returns (bool) {
+        if (key == SET_KEEPER) return v == 0;
+        if (key == SET_WETH_USDC_TICK_SPACING) return false;
+        return v <= _getSetting(key);
     }
 
     /* ------------------------------------------------------------------ */
@@ -374,12 +401,11 @@ contract IndexRouter is Ownable2Step, ReentrancyGuard {
         return x * (BPS - legSlippageBps) / BPS;
     }
 
-    function _setWethUsdcTickSpacing(int24 tickSpacing) internal {
-        if (registry.slipstreamFactory().getPool(address(weth), address(usdc), tickSpacing) == address(0)) {
+    function _requirePool(uint256 v) internal view {
+        int24 tickSpacing = int24(uint24(v));
+        if (v > type(uint24).max || registry.slipstreamFactory().getPool(address(weth), address(usdc), tickSpacing) == address(0)) {
             revert NoSuchPool(tickSpacing);
         }
-        wethUsdcTickSpacing = tickSpacing;
-        emit WethUsdcTickSpacingSet(tickSpacing);
     }
 
     function _onlyOwnerOrKeeper() internal view {

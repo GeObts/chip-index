@@ -3,8 +3,8 @@
 **Date:** 2026-10-13. **Reviews:** ChatGPT (findings 1–2, plus 7 questions) and Bankr (M-1, M-2,
 L-1, L-2, L-3). Nothing is deployed or pushed. Every change below is in local commits only.
 
-> **Reviewer IDs still to be matched.** The review texts were not attached when this response was
-> written. Each issue below is listed as the owner's instructions described it. The table in §1
+> **Reviewer IDs still to be matched.** The review texts have not been received yet (they were
+> not attached to either instruction, 2026-10-13). Each issue below is listed as the owner's instructions described it. The table in §1
 > leaves an empty slot to record which reviewer ID (ChatGPT 1/2, Bankr M-1/M-2/L-1/L-2/L-3) each
 > issue answers. Fill it in from the review texts before sending this back. Any ID that matches
 > none of these issues still needs its own row.
@@ -20,6 +20,12 @@ L-1, L-2, L-3). Nothing is deployed or pushed. Every change below is in local co
 | E | Can donations plus `sync()` move a mint into a cheaper fee tier profitably? | _to fill_ | **Not profitable; accepted by design** (§6) |
 | F | Does the keeper send a live-quoted `minChipOut` to `buyAndBurn`, never 0? | _to fill_ | **Fixed in the contract** (0 now reverts); the keeper script is not written yet (§7) |
 | Q1–Q7 | The 7 reviewer questions (REVIEW_PACKAGE §7) | ChatGPT questions | Answered in §8 |
+| G | Self-review item 4: a stolen keeper key can drain the vault through Rebalancer ping-pong | self-review | **Fixed** (§10.1) |
+| H | Self-review item 11: Safe powers that could cost holders money were instant | self-review | **Fixed** (§10.2) |
+| I | Self-review item 10: `` buys had no hard per-call limit and no daily cap | self-review | **Fixed** (§10.2) |
+| J | Self-review item 3: no explicit mint stop while a stock is paused or the vault is blocklisted | self-review | **Fixed** (§10.3) |
+| K | Self-review item 9: adding a stock checked nothing about the token or the feed | self-review | **Fixed**, one residual documented (§10.4) |
+| L | Self-review item 7: the 2,000 tiny mint/redeem loop was not a permanent test | self-review | **Fixed** (§10.5) |
 
 ## 2. Fix A — credits share a seizure pro-rata (IndexVault)
 
@@ -180,9 +186,9 @@ lowers NAV, which raises fees.
    - The fee pipeline test bought and burned $CHIP through the live hook.
    - The keeper's live quote (§7) absorbs the hook's fee changes.
    **Fixed** (non-zero floor); otherwise by design.
-5. **Management-fee rounding or ordering around `setFees` / `executeFeeRecipient`?** Both call
+5. **Management-fee rounding or ordering around a fee change / `executeFeeRecipient`?** Both call
    `_accrue()` first, so the old rate applies up to that moment and fees earned so far go to the
-   old recipient (`test_setFees_accruesAtOldRateFirst`). Accrual rounds down; `previewMint`,
+   old recipient (`test_mgmtFeeChange_accruesAtOldRateFirst`). Accrual rounds down; `previewMint`,
    `previewRedeem` and `mintFeeFor` all include the pending fee in supply. **Accepted by design.**
 6. **Can a minter cheaply cross a fee threshold (donation + `sync`), and is the `try` fallback
    sound?**
@@ -212,3 +218,141 @@ lowers NAV, which raises fees.
 - **Base mainnet fork (real B20s, base-forge): 36 passed, 0 failed** (was 34).
   - +1 real Aerodrome rebalance minimum test.
   - +1 seizure with an outstanding credit.
+
+## 10. Pre-round-2 hardening (owner instruction, 2026-10-13)
+
+### 10.1 Rebalancer drain (self-review item 4)
+
+**Before:** one rebalance of 48 NVDA↔MSTR ping-pong trades lost $101.77 (9.7%) of a $1,049 test vault
+and left it eligible to repeat, so a stolen keeper key could empty the vault in minutes.
+
+**Now, in the Rebalancer:**
+- No trade may push either stock past its target. After every trade the seller must still be at
+  or above target and the buyer at or below (`Overshoot`). Something sold can therefore never be
+  bought back, so ping-pong is impossible by construction.
+- The Chainlink value sold in one rebalance is capped at the basket's total overweight in dollars,
+  measured when the rebalance starts (`OverTradeBudget`).
+- Unchanged: sell only overweight, buy only underweight, total drift must fall, eligible only at
+  more than 3 points of drift or after 30 days.
+
+**Now, in the vault (binds this and ANY future Rebalancer):**
+- Max trade slippage tightened from 1% to **0.75%** (hard cap lowered from 2% to 1%). On the fork,
+  real Aerodrome rebalances filled at or better than Chainlink, so 0.75% blocked nothing.
+- **24h caps, proposed numbers:**
+  - Trading: **15% of NAV per day** (hard cap 25%). 15% lets the keeper sell off one whole stock
+    (12.5%) in a day when the basket changes. A normal 3-point rebalance trades about 3–5%.
+  - Value lost (Chainlink value in minus out, gains not netted): **0.10% of NAV per day** (hard
+    cap 0.5%). A legitimate 5% rebalance at the measured ~0.1–0.5% cost loses 0.005–0.025% of NAV.
+  - The window opens at the first trade after the previous one expired and prices NAV once then.
+    In the worst timing a rogue contract can use two windows back to back (0.20% of NAV in one
+    24h span); after that, 0.10% per day.
+- Lowering any of these is instant (0% slippage stops every trade); raising waits 48h.
+
+**The drain test is permanent** (`test/unit/RebalancerDrain.t.sol`) and must fail:
+
+| Test | Result |
+|---|---|
+| The self-review's exact 48-trade ping-pong | **reverts** (`OverTradeBudget`); NAV unchanged |
+| Small ping-pong, each leg within budget | **reverts** (`NotOverweight`: the stock just bought is never overweight) |
+| Stolen keeper, playing by the rules, rebalancing every 10 minutes for a day at the worst allowed fill (0.74%) | 1 rebalance went through, then not eligible: lost $0.32 of $1,049 (0.03%) |
+| Rogue Rebalancer installed through the timelock, ignoring every Rebalancer rule | the vault stopped it after 2 trades: lost $0.78 of $1,049 (0.074%, under the 0.10% cap); nothing more that day; next day capped again |
+
+### 10.2 Safe powers (self-review items 10 and 11)
+
+One mechanism in every contract (`src/lib/Settings.sol`):
+- `tighten(key, value)` is instant and only accepts a stricter value: a lower cap, fee, slippage
+  or feed age, or removing a keeper.
+- `queueSetting(key, value)`, then 48h later `executeSetting(key, value)`, for anything else
+  within the hard caps. The same 14-day grace and cancel apply as for every other timelock.
+
+Mapping of the owner's list:
+
+| Owner's list | Where | Now |
+|---|---|---|
+| pause, unpause | vault mint pause; router cash mint/redeem pause | instant (unchanged) |
+| removing a keeper | Router, Rebalancer, FeeSplitter | instant (`tighten(SET_KEEPER, 0)`) |
+| lowering a cap | all caps, fees, slippages, feed ages | instant |
+| redeem fee, management fee | vault | raise: 48h (cut: instant) |
+| adding keepers | Router, Rebalancer, FeeSplitter | 48h |
+| feed max age | registry (stocks), Router and FeeSplitter (ETH) | longer: 48h (shorter: instant) |
+| pool choice | registry: each stock's pool is now part of the basket (48h basket change); Router and FeeSplitter WETH/USDC pool | 48h only, never instant |
+| raising the mint cap | vault | 48h |
+| `` buy cap | FeeSplitter | raise: 48h; **hard limit $500 per call** (launch $100); new **daily cap $300 per 24h, hard limit $2,000** |
+
+Also moved behind the 48h rule (they could cost holders money): router leg slippage, the vault's
+trade slippage and daily caps, the FeeSplitter's sell slippage.
+
+Unit tests: fee cut instant and rise after 48h, mint cap rise after 48h, slippage and daily caps,
+max feed age, pool change, keeper remove/add on two contracts, `` per-call hard limit and daily cap.
+
+### 10.3 Mint stops while a stock is paused or the vault is blocklisted (item 3)
+
+`mint` and `seed` now call `_requireMintable()` before anything moves. It reverts
+`StockPaused(token)` if any listed stock has TRANSFER paused (`isPaused(0)`, the real B20 call),
+and `Blocklisted(vault, token)` if the vault is not authorized on any stock's policies. A public
+`requireMintable()` view lets the website show why minting is closed. Unit tests (paused,
+blocklisted, nothing moved) and fork checks on the real NVDA precompile and the real policy-5
+blocklist.
+
+### 10.4 A new stock must be real (item 9)
+
+Checked on `queueBasket` AND again on `executeBasket`, for every entry, so a fake is refused
+even if the Safe queues it:
+1. The token is a B20 according to Base's B20 factory precompile (`0xB20f…0000`,
+   `isB20Initialized`). A plain ERC-20 fails (`NotB20`).
+2. The feed has the same code hash and the same `owner()` as the launch feeds. Onchain, all 8
+   stock feeds and the ETH/USD feed are one Chainlink proxy code (hash `0xbd6f…66c2`) owned by
+   Chainlink's Base multisig `0xf0Db…5B1b`. A look-alike contract fails on code; a genuine proxy
+   deployed by anyone else fails on owner (Chainlink's ownership only moves when the new owner
+   accepts) (`UntrustedFeed`).
+3. The feed description is `Coinbase <TICKER>` for a token whose symbol is `<TICKER>c`
+   (e.g. `NVDAc` / `Coinbase NVDA`) (`FeedDoesNotMatchToken`).
+4. The token/USDC pool exists at the chosen tick spacing.
+
+If Chainlink ever migrates its feeds, the trusted owner and code hash can be updated through the
+48h timelock only.
+
+**Residual, documented:** the B20 factory proves the token is a B20, not that Coinbase issued it.
+Anyone can create a B20 called "NVDAc" through the factory. That fake would pass checks 1, 3 and 4,
+and check 2 when paired with Chainlink's real "Coinbase NVDA" feed. Coinbase's issuer address
+cannot be read onchain: the tokens emitted no role events at creation, and the policy-5 admin
+holds no token role. So the Safe must match the token address against
+api.coinbase.com/v1/tokenized-stocks before queueing, and the 48h gives everyone else the same
+chance. Tests: 4 unit tests (fake token, untrusted owner, look-alike code, wrong pairing, re-check
+at execute) and one fork test on the real chain (fake ERC-20, NVDA with MSTR's feed, look-alike
+feed naming Chainlink's owner; the genuine basket passes).
+
+### 10.5 2,000 tiny round trips (item 7)
+
+`test/unit/TinyRoundTrips.t.sol`: 2,000 mint→redeem loops of up to 0.001 index token (about
+$0.01). NAV per token started at $9.99999983 and never went below that (lowest seen $10.00000018,
+since rounding always leaves dust in the vault). No user got more of any stock out than they put
+in. (`foundry.toml` now allows 4B gas per test; this one uses 1.37B.)
+
+## 11. Worst case for a stolen keeper key (launch settings, $25,000 NAV)
+
+The keeper key is used by three contracts. Until the Safe removes it (instant, one transaction):
+
+| Contract | What a thief can do | Worst case |
+|---|---|---|
+| Rebalancer | Only rebalances that obey the rules above, at the worst allowed fill (0.75%) | ~0.03% of NAV per eligible episode ($7.50 at $25k), then nothing until drift exceeds 3 points again or 30 days pass. Hard ceiling enforced by the vault: **$25 per 24h window** (0.10%), at most $50 if two windows fall in one 24h span. Chainlink can lag the market by up to 0.5%, so the true market loss on the traded volume could be up to ~0.05% of NAV more. |
+| IndexFeeSplitter | Sell fee stock for USDC (Chainlink floor, 1%), buy `` with a bad `minChipOut` and sandwich it | Fee money only, never holders' stock: at most **$300 per day** of the `` budget ($100 per call). Selling at the 1% floor costs at most 1% of the fee stock sold. |
+| IndexRouter | Pause cash mint/redeem | No money: the Safe unpauses, and in-kind redeem never stops |
+
+**Total: about $25–50 of holders' value per day plus up to $300 per day of fee money**, versus
+"most of the vault within minutes" before. Holders' share scales with NAV (0.10% per day); the
+fee-money cap does not.
+
+## 12. Test counts after the pre-round-2 hardening (2026-10-13)
+
+- **Unit + invariant (mocks): 134 passed, 0 failed** (was 115; forge 1.8.x shows 132).
+  - New: 4 drain, 1 tiny-loop, 3 mint-stop/mint-cap, 5 registry authenticity/settings,
+    2 router settings, 3 splitter caps/keeper.
+  - Rebalancer tests now send keeper-sized trades (none past target), plus buyer-overshoot and
+    over-budget refusals.
+- **Base mainnet fork: 37 passed, 0 failed** (was 36).
+  - New: basket authenticity on the real chain.
+  - Added to existing tests: mint refused up front on a real paused stock and with the real
+    blocklist.
+  - The deploy rehearsal now also proves the real launch basket passes every authenticity check.
+  - Both rebalance tests now spread the sale over all 7 underweight stocks.

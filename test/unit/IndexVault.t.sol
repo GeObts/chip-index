@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {IndexVault} from "../../src/IndexVault.sol";
+import {Settings} from "../../src/lib/Settings.sol";
 import {Timelock} from "../../src/lib/Timelock.sol";
 import {Fixture} from "../Fixture.sol";
 import {MockB20} from "../mocks/Mocks.sol";
@@ -53,8 +54,9 @@ contract IndexVaultTest is Fixture {
     }
 
     function test_mint_capPauseAndZero() public {
+        uint8 capKey = vault.SET_MINT_CAP();
         vm.prank(safe);
-        vault.setMintCap(105e18);
+        vault.tighten(capKey, 105e18); // lowering the cap is instant
         _fundForMint(alice, 10e18);
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(IndexVault.MintCapExceeded.selector, 110e18, 105e18));
@@ -71,6 +73,47 @@ contract IndexVaultTest is Fixture {
         vm.prank(alice);
         vm.expectRevert(IndexVault.ZeroShares.selector);
         vault.mint(0, alice);
+    }
+
+    /// Raising the mint cap waits 48h.
+    function test_mintCap_raiseIsTimelocked() public {
+        uint8 k = vault.SET_MINT_CAP();
+        vm.startPrank(safe);
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, k, 2_000_000e18));
+        vault.tighten(k, 2_000_000e18);
+        vault.queueSetting(k, 2_000_000e18);
+        vm.warp(block.timestamp + 47 hours);
+        vm.expectRevert();
+        vault.executeSetting(k, 2_000_000e18);
+        vm.warp(block.timestamp + 1 hours);
+        vault.executeSetting(k, 2_000_000e18);
+        vm.stopPrank();
+        assertEq(vault.mintCap(), 2_000_000e18);
+    }
+
+    /// Item 3: all minting stops while any stock is paused by its issuer, or the vault is
+    /// blocklisted on any stock, before a single token moves.
+    function test_mint_blockedWhileAnyStockPaused() public {
+        _fundForMint(alice, 1e18);
+        stocks[6].setPaused(true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.StockPaused.selector, address(stocks[6])));
+        vault.mint(1e18, alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.StockPaused.selector, address(stocks[6])));
+        vault.requireMintable();
+
+        stocks[6].setPaused(false);
+        vm.prank(alice);
+        vault.mint(1e18, alice);
+    }
+
+    function test_mint_blockedWhileVaultBlocklisted() public {
+        _fundForMint(alice, 1e18);
+        stocks[2].setBlocked(address(vault), true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, address(vault), address(stocks[2])));
+        vault.mint(1e18, alice);
+        assertEq(stocks[0].balanceOf(address(vault)), vault.held(address(stocks[0])), "nothing moved");
     }
 
     function test_mint_revertsWithoutApproval() public {
@@ -278,27 +321,39 @@ contract IndexVaultTest is Fixture {
 
     /* --------------------------- fee caps ---------------------------- */
 
+    /// Fee increases wait 48h and stay under the hard caps; cuts are instant.
     function test_feeCaps() public {
+        uint8 r = vault.SET_REDEEM_FEE();
+        uint8 m = vault.SET_MGMT_FEE();
         vm.startPrank(safe);
         vm.expectRevert(abi.encodeWithSelector(IndexVault.FeeAboveCap.selector, 201, 200));
-        vault.setFees(201, 300);
+        vault.queueSetting(r, 201);
         vm.expectRevert(abi.encodeWithSelector(IndexVault.FeeAboveCap.selector, 501, 500));
-        vault.setFees(100, 501);
-        vault.setFees(200, 500);
-        vm.stopPrank();
+        vault.queueSetting(m, 501);
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, r, 200));
+        vault.tighten(r, 200);
+        vault.queueSetting(r, 200);
+        vault.queueSetting(m, 500);
+        vm.warp(block.timestamp + 48 hours);
+        vault.executeSetting(r, 200);
+        vault.executeSetting(m, 500);
         assertEq(vault.redeemFeeBps(), 200);
         assertEq(vault.mgmtFeeBps(), 500);
+        vault.tighten(r, 50);
+        vm.stopPrank();
+        assertEq(vault.redeemFeeBps(), 50);
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        vault.setFees(0, 0);
+        vault.tighten(r, 0);
     }
 
-    function test_setFees_accruesAtOldRateFirst() public {
+    function test_mgmtFeeChange_accruesAtOldRateFirst() public {
         uint256 supply = vault.totalSupply();
         vm.warp(block.timestamp + 365 days);
+        uint8 m = vault.SET_MGMT_FEE();
         vm.prank(safe);
-        vault.setFees(100, 0);
+        vault.tighten(m, 0);
         assertEq(vault.balanceOf(address(splitter)), supply * 3 / 100);
     }
 
@@ -532,10 +587,29 @@ contract IndexVaultTest is Fixture {
         vault.wire(alice, alice);
     }
 
-    function test_trade_slippageCap() public {
-        vm.prank(safe);
-        vm.expectRevert(abi.encodeWithSelector(IndexVault.FeeAboveCap.selector, 201, 200));
-        vault.setMaxTradeSlippageBps(201);
+    /// Rebalance slippage: 0.75% at launch, hard cap 1%, raising waits 48h. Same for the daily caps.
+    function test_trade_slippageAndDailyCaps() public {
+        assertEq(vault.maxTradeSlippageBps(), 75);
+        assertEq(vault.dailyTradeCapBps(), 1_500);
+        assertEq(vault.dailyLossCapBps(), 10);
+        uint8 slip = vault.SET_MAX_TRADE_SLIPPAGE();
+        uint8 tradeCap = vault.SET_DAILY_TRADE_CAP();
+        uint8 lossCap = vault.SET_DAILY_LOSS_CAP();
+        vm.startPrank(safe);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.FeeAboveCap.selector, 101, 100));
+        vault.queueSetting(slip, 101);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.FeeAboveCap.selector, 2_501, 2_500));
+        vault.queueSetting(tradeCap, 2_501);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.FeeAboveCap.selector, 51, 50));
+        vault.queueSetting(lossCap, 51);
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, slip, 100));
+        vault.tighten(slip, 100);
+        vault.tighten(slip, 0); // emergency brake: blocks every trade
+        vault.tighten(lossCap, 0);
+        vm.expectRevert(abi.encodeWithSelector(Settings.UnknownSetting.selector, 9));
+        vault.tighten(9, 0);
+        vm.stopPrank();
+        assertEq(vault.maxTradeSlippageBps(), 0);
     }
 
     /* ----------------------------- fuzz ------------------------------ */

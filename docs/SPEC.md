@@ -31,7 +31,8 @@ Addresses verified 2026-10-12 against api.coinbase.com/v1/tokenized-stocks (all 
 | Launch | "Chip Index"/"CHIPX"; seed $1,000 for 100 tokens; $CHIP buys at most $100 each. All in `LaunchConfig`, script/Deploy.s.sol. |
 | Fees (launch / hard cap) | mint size-tiered by the NAV value of one mint: 1% under $10,000, 0.75% from $10,000, 0.5% from $50,000; every rate capped at 1%, schedule behind the 48h timelock (owner decision 2026-10-13; was a flat 1% / 2% cap). Redeem 1% / 2%, management 3%/yr / 5%/yr (accrued continuously as newly minted index tokens). |
 | Fee destination | New IndexFeeSplitter. Fees are sold to USDC: 50% goes to Pot `0x3918a9B4…855B` and 50% buys $CHIP (Uniswap v4 pool, keeper-supplied min-out, size cap) and sends it to ChipBurner `0x7Bc1C03e…5C0`. |
-| Rebalancer | Keeper only. It may trade any time a stock drifts more than 3 points from its target, and also once per 30 days regardless of drift. Every trade has slippage caps. |
+| Rebalancer | Keeper only. It may trade any time a stock drifts more than 3 points from its target, and also once per 30 days regardless of drift. Every trade has slippage caps (0.75%), no trade may push a stock past its target, one rebalance sells at most the overweight, and the vault caps rebalance trading at 15% of NAV and losses at 0.10% of NAV per 24h (owner instruction 2026-10-13). |
+| Safe settings | Stricter values (pause, unpause, removing a keeper, lowering a cap, fee or limit) are instant; anything that could cost holders money waits 48h (owner instruction 2026-10-13). |
 | Basket changes | BasketRegistry: add/remove ticker and change weights through a 48h timelock with a 14-day grace window (the Anvil pattern). |
 | Ownership | All contracts are Ownable2Step, owned by Safe `0xe1096B72…73C7` from the constructor. Keeper is `0x6571E341…95B9`. |
 | Out of scope | Staking, Morpho, Superform (phase 2). |

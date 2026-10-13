@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -9,11 +9,16 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {BasketRegistry} from "./BasketRegistry.sol";
-import {Timelock} from "./lib/Timelock.sol";
+import {Settings} from "./lib/Settings.sol";
 
 /// @dev The two B20 surfaces the blocklist check needs (base-std IB20 / IPolicyRegistry).
 interface IB20Policy {
     function policyId(bytes32 policyScope) external view returns (uint64);
+}
+
+interface IB20Pausable {
+    /// @dev `feature` 0 = TRANSFER (base-std IB20.PausableFeature).
+    function isPaused(uint8 feature) external view returns (bool);
 }
 
 interface IPolicyRegistryView {
@@ -61,7 +66,7 @@ interface IRebalanceCallback {
  *         goes through, at the base (highest) rate: no fresh price, no discount. The schedule
  *         changes only through the 48h timelock, and no rate may exceed MAX_MINT_FEE_BPS (1%).
  */
-contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
+contract IndexVault is ERC20, Settings, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 public constant BPS = 10_000;
@@ -69,7 +74,10 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     uint256 public constant MAX_MINT_FEE_BPS = 100; // 1%, every tier
     uint256 public constant MAX_REDEEM_FEE_BPS = 200; // 2%
     uint256 public constant MAX_MGMT_FEE_BPS = 500; // 5% a year
-    uint256 public constant MAX_TRADE_SLIPPAGE_BPS = 200; // rebalance hard cap
+    uint256 public constant MAX_TRADE_SLIPPAGE_BPS = 100; // rebalance hard cap (launch 0.75%)
+    uint256 public constant MAX_DAILY_TRADE_BPS = 2_500; // hard cap: 25% of NAV traded per day
+    uint256 public constant MAX_DAILY_LOSS_BPS = 50; // hard cap: 0.5% of NAV lost per day
+    uint256 public constant TRADE_WINDOW = 1 days;
     /// @dev Gas forwarded to each B20 transfer on redeem. A real B20 transfer measured ~30k on a
     ///      Base fork (2026-10-12); this is generous so a leg only fails when the token refuses.
     uint256 public constant REDEEM_LEG_GAS = 250_000;
@@ -77,6 +85,15 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     bytes32 public constant ACTION_REBALANCER = keccak256("REBALANCER");
     bytes32 public constant ACTION_FEE_RECIPIENT = keccak256("FEE_RECIPIENT");
     bytes32 public constant ACTION_MINT_FEE_SCHEDULE = keccak256("MINT_FEE_SCHEDULE");
+
+    /// @notice Setting keys (see lib/Settings.sol). Lowering any of them is instant; raising goes
+    ///         through the 48h timelock.
+    uint8 public constant SET_REDEEM_FEE = 0; // bps, <= MAX_REDEEM_FEE_BPS
+    uint8 public constant SET_MGMT_FEE = 1; // bps a year, <= MAX_MGMT_FEE_BPS
+    uint8 public constant SET_MINT_CAP = 2; // index token units
+    uint8 public constant SET_MAX_TRADE_SLIPPAGE = 3; // bps, <= MAX_TRADE_SLIPPAGE_BPS
+    uint8 public constant SET_DAILY_TRADE_CAP = 4; // bps of NAV, <= MAX_DAILY_TRADE_BPS
+    uint8 public constant SET_DAILY_LOSS_CAP = 5; // bps of NAV, <= MAX_DAILY_LOSS_BPS
     bytes32 public constant TRANSFER_SENDER_POLICY = keccak256("TRANSFER_SENDER_POLICY");
     bytes32 public constant TRANSFER_RECEIVER_POLICY = keccak256("TRANSFER_RECEIVER_POLICY");
     bytes32 public constant TRANSFER_EXECUTOR_POLICY = keccak256("TRANSFER_EXECUTOR_POLICY");
@@ -116,10 +133,20 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     MintFeeSchedule internal _mintFees;
     uint16 public redeemFeeBps;
     uint16 public mgmtFeeBps;
-    uint16 public maxTradeSlippageBps = 100;
+    uint16 public maxTradeSlippageBps = 75;
+    /// @notice Rebalance trading allowed per 24h window, and Chainlink value it may lose, both in
+    ///         bps of NAV at the window's first trade. Enforced here, so they bind ANY Rebalancer.
+    uint16 public dailyTradeCapBps = 1_500; // 15% of NAV: one whole stock (12.5%) can be sold off in a day
+    uint16 public dailyLossCapBps = 10; // 0.10% of NAV
     bool public mintPaused;
     uint64 public lastAccrual;
     uint256 public mintCap;
+
+    /// @notice The current 24h trade window: when it opened, NAV then, and what was traded and lost.
+    uint64 public tradeWindowStart;
+    uint256 public windowNavUsd;
+    uint256 public windowTradedUsd;
+    uint256 public windowLostUsd;
 
     event Seeded(address indexed to, uint256 shares, uint256[] amounts);
     event Minted(address indexed caller, address indexed to, uint256 shares, uint256 fee, uint256[] amounts);
@@ -134,9 +161,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     event Traded(address indexed tokenIn, uint256 amountIn, address indexed tokenOut, uint256 amountOut);
     event FeesSet(uint16 redeemFeeBps, uint16 mgmtFeeBps);
     event MintFeeScheduleSet(MintFeeSchedule schedule);
-    event MintCapSet(uint256 mintCap);
     event MintPausedSet(bool paused);
-    event MaxTradeSlippageSet(uint16 bps);
     event RebalancerSet(address rebalancer);
     event FeeRecipientSet(address feeRecipient);
 
@@ -162,6 +187,9 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     error NotDeployer();
     error AlreadyWired();
     error Blocklisted(address account, address token);
+    error StockPaused(address token);
+    error DailyTradeCapExceeded(uint256 tradedUsd, uint256 capUsd);
+    error DailyLossCapExceeded(uint256 lostUsd, uint256 capUsd);
 
     constructor(
         address owner_,
@@ -208,6 +236,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         if (to == address(0) || feeRecipient == address(0)) revert ZeroAddress();
         address[] memory list = registry.tokens();
         if (amounts.length != list.length) revert LengthMismatch();
+        _requireMintable();
         bool any;
         for (uint256 i; i < list.length; ++i) {
             if (amounts[i] == 0) continue;
@@ -240,6 +269,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         if (shares == 0) revert ZeroShares();
         if (to == address(0)) revert ZeroAddress();
         if (totalSupply() == 0) revert NotSeeded();
+        _requireMintable();
         _accrue();
 
         // Priced before the deposit lands, against the same supply previewMint uses.
@@ -400,6 +430,21 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         if (t != address(0)) revert Blocklisted(account, t);
     }
 
+    /// @notice Minting stops outright while any listed stock has transfers paused by its issuer,
+    ///         or the issuer has blocklisted the vault on any of them. Otherwise stock could flow
+    ///         in that the vault cannot send back out. Reverts StockPaused / Blocklisted(vault, t).
+    function requireMintable() external view {
+        _requireMintable();
+    }
+
+    function _requireMintable() internal view {
+        address[] memory list = registry.tokens();
+        for (uint256 i; i < list.length; ++i) {
+            if (IB20Pausable(list[i]).isPaused(0)) revert StockPaused(list[i]);
+        }
+        _requireNotBlocked(address(this), address(this), address(this));
+    }
+
     /// @dev One pass: every listed stock x 3 scopes, each DISTINCT policy id queried once per
     ///      distinct account (Coinbase uses one id for all 24 slots today, so that is 1-3 queries).
     function _requireNotBlocked(address a, address b, address c) internal view {
@@ -491,6 +536,7 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         if (amountIn > h) revert InsufficientHeld(tokenIn, amountIn, h);
 
         uint256 valueIn = registry.valueUsd(tokenIn, amountIn);
+        _countTraded(valueIn);
         uint256 inBefore = IERC20(tokenIn).balanceOf(address(this));
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
 
@@ -505,8 +551,31 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         if (valueOut * BPS < valueIn * (BPS - maxTradeSlippageBps)) {
             revert TradeValueLoss(valueIn, valueOut, maxTradeSlippageBps);
         }
+        if (valueIn > valueOut) _countLost(valueIn - valueOut);
         held[tokenOut] += received;
         emit Traded(tokenIn, amountIn, tokenOut, received);
+    }
+
+    /// @dev Opens a fresh 24h window (pricing NAV once) on the first trade after the last one
+    ///      expired, then adds this trade's Chainlink value to the window's total.
+    function _countTraded(uint256 valueIn) internal {
+        if (block.timestamp >= uint256(tradeWindowStart) + TRADE_WINDOW) {
+            tradeWindowStart = uint64(block.timestamp);
+            windowNavUsd = navUsd();
+            windowTradedUsd = 0;
+            windowLostUsd = 0;
+        }
+        uint256 traded = windowTradedUsd + valueIn;
+        uint256 cap = windowNavUsd * dailyTradeCapBps / BPS;
+        if (traded > cap) revert DailyTradeCapExceeded(traded, cap);
+        windowTradedUsd = traded;
+    }
+
+    function _countLost(uint256 lost) internal {
+        uint256 total = windowLostUsd + lost;
+        uint256 cap = windowNavUsd * dailyLossCapBps / BPS;
+        if (total > cap) revert DailyLossCapExceeded(total, cap);
+        windowLostUsd = total;
     }
 
     /* ------------------------------------------------------------------ */
@@ -533,12 +602,10 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
     /*                         Owner settings                              */
     /* ------------------------------------------------------------------ */
 
-    /// @notice Redeem and management fees. Immediate, not timelocked. The mint fee schedule is
-    ///         separate and timelocked: queueMintFeeSchedule / executeMintFeeSchedule.
-    function setFees(uint16 redeemFeeBps_, uint16 mgmtFeeBps_) external onlyOwner {
-        _accrue(); // the old management rate applies up to now
-        _setFees(redeemFeeBps_, mgmtFeeBps_);
-    }
+    // Redeem fee, management fee, mint cap, trade slippage and the daily trade caps are
+    // 	ighten (lower, instant) / queueSetting + executeSetting (anything, 48h): see
+    // lib/Settings.sol and the SET_* keys. The mint fee schedule, rebalancer and fee recipient
+    // have their own timelocked functions below. Mint pause is instant both ways.
 
     /// @notice Queue a new mint fee schedule (48h timelock). Checked now and again on execute.
     function queueMintFeeSchedule(MintFeeSchedule calldata s) external onlyOwner returns (bytes32) {
@@ -551,21 +618,12 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         _setMintFees(s);
     }
 
-    function setMintCap(uint256 mintCap_) external onlyOwner {
-        mintCap = mintCap_;
-        emit MintCapSet(mintCap_);
-    }
 
     function setMintPaused(bool paused) external onlyOwner {
         mintPaused = paused;
         emit MintPausedSet(paused);
     }
 
-    function setMaxTradeSlippageBps(uint16 bps) external onlyOwner {
-        if (bps > MAX_TRADE_SLIPPAGE_BPS) revert FeeAboveCap(bps, MAX_TRADE_SLIPPAGE_BPS);
-        maxTradeSlippageBps = bps;
-        emit MaxTradeSlippageSet(bps);
-    }
 
     function queueRebalancer(address r) external onlyOwner returns (bytes32) {
         if (r == address(0)) revert ZeroAddress();
@@ -590,8 +648,53 @@ contract IndexVault is ERC20, Ownable2Step, ReentrancyGuard, Timelock {
         emit FeeRecipientSet(r);
     }
 
-    function cancelChange(bytes32 id) external onlyOwner {
-        _cancel(id);
+    /* ------------------------------------------------------------------ */
+    /*                        Settings (lib/Settings)                      */
+    /* ------------------------------------------------------------------ */
+
+    function _checkSetting(uint8 key, uint256 v) internal pure override {
+        if (key == SET_REDEEM_FEE) {
+            if (v > MAX_REDEEM_FEE_BPS) revert FeeAboveCap(v, MAX_REDEEM_FEE_BPS);
+        } else if (key == SET_MGMT_FEE) {
+            if (v > MAX_MGMT_FEE_BPS) revert FeeAboveCap(v, MAX_MGMT_FEE_BPS);
+        } else if (key == SET_MINT_CAP) {
+            // any value; raising it is the timelocked direction
+        } else if (key == SET_MAX_TRADE_SLIPPAGE) {
+            if (v > MAX_TRADE_SLIPPAGE_BPS) revert FeeAboveCap(v, MAX_TRADE_SLIPPAGE_BPS);
+        } else if (key == SET_DAILY_TRADE_CAP) {
+            if (v > MAX_DAILY_TRADE_BPS) revert FeeAboveCap(v, MAX_DAILY_TRADE_BPS);
+        } else if (key == SET_DAILY_LOSS_CAP) {
+            if (v > MAX_DAILY_LOSS_BPS) revert FeeAboveCap(v, MAX_DAILY_LOSS_BPS);
+        } else {
+            revert UnknownSetting(key);
+        }
+    }
+
+    function _getSetting(uint8 key) internal view override returns (uint256) {
+        if (key == SET_REDEEM_FEE) return redeemFeeBps;
+        if (key == SET_MGMT_FEE) return mgmtFeeBps;
+        if (key == SET_MINT_CAP) return mintCap;
+        if (key == SET_MAX_TRADE_SLIPPAGE) return maxTradeSlippageBps;
+        if (key == SET_DAILY_TRADE_CAP) return dailyTradeCapBps;
+        if (key == SET_DAILY_LOSS_CAP) return dailyLossCapBps;
+        revert UnknownSetting(key);
+    }
+
+    function _applySetting(uint8 key, uint256 v) internal override {
+        if (key == SET_REDEEM_FEE) {
+            redeemFeeBps = uint16(v);
+        } else if (key == SET_MGMT_FEE) {
+            _accrue(); // the old management rate applies up to now
+            mgmtFeeBps = uint16(v);
+        } else if (key == SET_MINT_CAP) {
+            mintCap = v;
+        } else if (key == SET_MAX_TRADE_SLIPPAGE) {
+            maxTradeSlippageBps = uint16(v);
+        } else if (key == SET_DAILY_TRADE_CAP) {
+            dailyTradeCapBps = uint16(v);
+        } else {
+            dailyLossCapBps = uint16(v);
+        }
     }
 
     /* ------------------------------------------------------------------ */

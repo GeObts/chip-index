@@ -42,9 +42,10 @@ also means a new vault.
 3. On the old set:
    - `vault.setMintPaused(true)` — no new money goes into the old vault.
    - `router.pauseCashMint()` on the old router.
-   - `vault.setFees(0, 0)` — no redeem fee and no management fee, so leaving is free and remaining
-     holders stop paying. (This takes effect immediately.)
-   - `rebalancer.setKeeper(address(0))` — no more trades in the old vault.
+   - `vault.tighten(SET_REDEEM_FEE, 0)` and `vault.tighten(SET_MGMT_FEE, 0)` — no redeem fee and no
+     management fee, so leaving is free and remaining holders stop paying. (Cuts take effect
+     immediately; only increases wait 48h.)
+   - `rebalancer.tighten(SET_KEEPER, 0)` — no more trades in the old vault (instant).
    - Leave in-kind redeem and the old router's cash redeem as they are. Do not change the basket.
 4. Keep the old fee splitter running until it has redeemed and sold the fees it already holds.
 

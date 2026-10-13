@@ -50,7 +50,7 @@ contract DeployScriptForkTest is Test {
 
     /// @dev Keep each real price, refresh only updatedAt (so the rehearsal also runs on weekends).
     function _freshenFeeds() internal {
-        (BasketRegistry.AssetConfig[] memory cfg,) = Addrs.basket();
+        BasketRegistry.AssetConfig[] memory cfg = Addrs.basket();
         for (uint256 i; i < cfg.length; ++i) {
             (uint80 r, int256 a, uint256 s,, uint80 air) = IAggregatorV3(cfg[i].feed).latestRoundData();
             vm.mockCall(

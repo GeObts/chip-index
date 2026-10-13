@@ -31,6 +31,20 @@ contract RebalancerTest is Fixture {
         });
     }
 
+    /// Dollars by which `i` is over (+) or under (-) its target right now.
+    function _gapUsd(uint256 i) internal view returns (int256) {
+        (, int256[] memory d) = rebalancer.drifts();
+        return d[i] * int256(vault.navUsd()) / 1e18;
+    }
+
+    /// A trade a careful keeper would send: `pct`% of the smaller of the seller's overweight and
+    /// the buyer's underweight, so neither crosses its target.
+    function _fair(uint256 sell, uint256 buy, uint256 pct) internal view returns (Rebalancer.Trade[] memory) {
+        uint256 over = uint256(_gapUsd(sell));
+        uint256 under = uint256(-_gapUsd(buy));
+        return _trade(sell, buy, (over < under ? over : under) * pct / 100);
+    }
+
     function test_notEligible_smallDriftWithin30Days() public {
         _rally(0, 10); // NVDA ~13.6%: drift ~1.1 points
         (bool ok, uint256 maxDrift,) = rebalancer.eligible();
@@ -45,7 +59,7 @@ contract RebalancerTest is Fixture {
     function test_eligible_after30DaysEvenWithSmallDrift() public {
         _rally(0, 10);
         _warpFresh(30 days);
-        Rebalancer.Trade[] memory t = _trade(0, 1, 10e18);
+        Rebalancer.Trade[] memory t = _fair(0, 1, 90);
         vm.prank(keeper);
         rebalancer.rebalance(t, block.timestamp + 1);
         assertEq(rebalancer.lastRebalanceAt(), block.timestamp);
@@ -61,7 +75,11 @@ contract RebalancerTest is Fixture {
         uint256 mstrBefore = vault.held(address(stocks[1]));
         uint256 navBefore = vault.navUsd();
 
-        Rebalancer.Trade[] memory t = _trade(0, 1, 40e18);
+        // Sell NVDA's overweight into the seven underweight stocks, none past its target.
+        Rebalancer.Trade[] memory t = new Rebalancer.Trade[](7);
+        for (uint256 j = 1; j < 8; ++j) {
+            t[j - 1] = _fair(0, j, 95)[0];
+        }
         vm.prank(keeper);
         rebalancer.rebalance(t, deadline);
 
@@ -87,19 +105,29 @@ contract RebalancerTest is Fixture {
         rebalancer.rebalance(t, deadline);
     }
 
-    function test_rebalance_overshootRejected() public {
+    /// Buying more MSTR than it is short of pushes it past its target: refused.
+    function test_rebalance_buyerOvershootRejected() public {
         _rally(0, 40);
-        // Selling ~$140 of NVDA swings it from ~4 points over to ~9 points under.
+        assertGt(uint256(_gapUsd(0)), 3 * uint256(-_gapUsd(1)), "NVDA's overweight dwarfs MSTR's gap");
+        Rebalancer.Trade[] memory t = _trade(0, 1, uint256(-_gapUsd(1)) * 2);
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(Rebalancer.Overshoot.selector, address(stocks[1])));
+        rebalancer.rebalance(t, deadline);
+    }
+
+    /// Selling more than the whole basket's overweight in one rebalance: refused before trading.
+    function test_rebalance_overTradeBudgetRejected() public {
+        _rally(0, 40);
         Rebalancer.Trade[] memory t = _trade(0, 1, 140e18);
         vm.prank(keeper);
-        vm.expectRevert();
+        vm.expectPartialRevert(Rebalancer.OverTradeBudget.selector);
         rebalancer.rebalance(t, deadline);
     }
 
     function test_rebalance_vaultEnforcesSlippage() public {
         _rally(0, 40);
         swap.setSkewBps(150); // pool fills 1.5% below Chainlink
-        Rebalancer.Trade[] memory t = _trade(0, 1, 40e18);
+        Rebalancer.Trade[] memory t = _fair(0, 1, 90);
         vm.prank(keeper);
         vm.expectRevert();
         rebalancer.rebalance(t, deadline);
@@ -109,7 +137,7 @@ contract RebalancerTest is Fixture {
     /// bad fill is refused inside the swap router, before the vault's own check even runs.
     function test_rebalance_swapCarriesChainlinkMinimum() public {
         _rally(0, 40);
-        Rebalancer.Trade[] memory t = _trade(0, 1, 40e18);
+        Rebalancer.Trade[] memory t = _fair(0, 1, 90);
         uint256 expectedMin = registry.amountForUsd(
             address(stocks[1]),
             registry.valueUsd(address(stocks[0]), t[0].amountIn) * (10_000 - vault.maxTradeSlippageBps()) / 10_000
@@ -119,23 +147,22 @@ contract RebalancerTest is Fixture {
         rebalancer.rebalance(t, deadline);
         assertEq(swap.lastAmountOutMinimum(), expectedMin, "min-out sent to the swap");
 
-        // A fill 1.5% under Chainlink (limit 1%) now fails in the swap router itself.
-        _rally(0, 80);
-        swap.setSkewBps(150);
-        t = _trade(0, 2, 40e18); // MSTR is no longer underweight; GOOGL is
+        // A fill 1% under Chainlink (limit 0.75%) now fails in the swap router itself.
+        swap.setSkewBps(100);
+        t = _fair(0, 2, 90);
         vm.prank(keeper);
         vm.expectRevert("Too little received");
         rebalancer.rebalance(t, deadline);
 
-        // Within the limit (0.9%) it fills.
-        swap.setSkewBps(90);
+        // Within the limit (0.7%) it fills.
+        swap.setSkewBps(70);
         vm.prank(keeper);
         rebalancer.rebalance(t, deadline);
     }
 
     function test_rebalance_keeperMinOutEnforced() public {
         _rally(0, 40);
-        Rebalancer.Trade[] memory t = _trade(0, 1, 40e18);
+        Rebalancer.Trade[] memory t = _fair(0, 1, 90);
         t[0].minOut = type(uint256).max;
         vm.prank(keeper);
         vm.expectRevert();
@@ -179,8 +206,8 @@ contract RebalancerTest is Fixture {
         vm.prank(safe);
         registry.executeBasket(cfg);
 
-        uint256 msftUsd = vault.held(address(stocks[7])) * uint256(prices8[7]) * 1e10 / 1e8;
-        Rebalancer.Trade[] memory t = _trade(7, 1, msftUsd);
+        Rebalancer.Trade[] memory t = new Rebalancer.Trade[](1);
+        t[0] = Rebalancer.Trade(address(stocks[7]), address(stocks[1]), vault.held(address(stocks[7])), 0);
         vm.prank(keeper);
         rebalancer.rebalance(t, block.timestamp + 1);
         assertLt(vault.held(address(stocks[7])), 1e5);

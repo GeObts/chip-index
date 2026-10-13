@@ -14,6 +14,7 @@ import {PoolKey} from "../src/interfaces/IUniswapV4.sol";
 import {
     MockAggregator,
     MockB20,
+    MockB20Factory,
     MockChipBurner,
     MockERC20,
     MockPolicyRegistry,
@@ -61,6 +62,7 @@ abstract contract Fixture is Test {
     MockPoolManager internal poolManager;
     MockChipBurner internal burner;
     MockPolicyRegistry internal policies;
+    MockB20Factory internal b20Factory;
 
     BasketRegistry internal registry;
     IndexVault internal vault;
@@ -83,24 +85,25 @@ abstract contract Fixture is Test {
         poolManager = new MockPoolManager(1_000_000e18); // 1 WETH = 1M CHIP
         burner = new MockChipBurner(chip);
         policies = new MockPolicyRegistry();
+        b20Factory = new MockB20Factory();
 
         swap.setPrice(address(usdc), 1e18);
         swap.setPrice(address(weth), 2_600e18);
         factory.setPool(address(weth), address(usdc), TS);
 
         BasketRegistry.AssetConfig[] memory cfg = new BasketRegistry.AssetConfig[](N);
-        int24[] memory ts = new int24[](N);
         for (uint256 i; i < N; ++i) {
             // Each mock stock has its own policy id (i + 1) so tests can block on one stock only.
             stocks[i] = new MockB20(tickers[i], string.concat(tickers[i], "c"), policies, uint64(i + 1));
             feeds[i] = new MockAggregator(8, prices8[i]);
+            feeds[i].setDescription(string.concat("Coinbase ", tickers[i]));
+            b20Factory.setB20(address(stocks[i]), true);
             factory.setPool(address(stocks[i]), address(usdc), TS);
             swap.setPrice(address(stocks[i]), uint256(prices8[i]) * 1e10);
-            cfg[i] = BasketRegistry.AssetConfig(address(stocks[i]), address(feeds[i]), 1_250);
-            ts[i] = TS;
+            cfg[i] = BasketRegistry.AssetConfig(address(stocks[i]), address(feeds[i]), 1_250, TS);
         }
 
-        registry = new BasketRegistry(safe, address(sequencer), address(factory), address(usdc), cfg, ts);
+        registry = new BasketRegistry(safe, address(sequencer), address(factory), address(usdc), address(b20Factory), cfg);
         vault = new IndexVault(safe, registry, address(policies), "Chip Index", "CHIPX", launchMintFees(), 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(safe, vault, ISlipstreamRouter(address(swap)), address(usdc), keeper);
         router = new IndexRouter(
@@ -128,7 +131,8 @@ abstract contract Fixture is Test {
                 chipPoolKey: PoolKey(address(weth), address(chip), 0x800000, 200, address(0xB00C)),
                 wethUsdcTickSpacing: TS,
                 keeper: keeper,
-                maxChipBuyUsdc: 10_000e6
+                maxChipBuyUsdc: 500e6,
+                dailyChipBuyUsdc: 2_000e6
             })
         );
         registry.wireVault(address(vault));
@@ -184,7 +188,7 @@ abstract contract Fixture is Test {
         BasketRegistry.Asset[] memory a = registry.assets();
         cfg = new BasketRegistry.AssetConfig[](a.length);
         for (uint256 i; i < a.length; ++i) {
-            cfg[i] = BasketRegistry.AssetConfig(a[i].token, a[i].feed, a[i].weightBps);
+            cfg[i] = BasketRegistry.AssetConfig(a[i].token, a[i].feed, a[i].weightBps, registry.usdcTickSpacing(a[i].token));
         }
     }
 }

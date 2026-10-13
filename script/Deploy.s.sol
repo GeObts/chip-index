@@ -22,13 +22,15 @@ library LaunchConfig {
     string internal constant SYMBOL = "CHIPX";
 
     /// Total cap on index tokens in existence, for ALL holders together (no per-wallet limit).
-    /// 2,500 tokens = $25,000 at the $10 launch price. The Safe can raise it later (setMintCap).
+    /// 2,500 tokens = $25,000 at the $10 launch price. The Safe can lower it instantly, or raise it
+    /// through the 48h timelock (vault.queueSetting(SET_MINT_CAP, ...)).
     uint256 internal constant MINT_CAP_TOKENS = 2_500;
 
     /// Most USDC one $CHIP buy may spend. Fork-measured 2026-10-12: a $100 buy fills 0.68% worse
     /// than spot (pool fee ~0.38% + impact ~0.30%), inside the 1% limit; $250 was 1.13%.
     uint256 internal constant MAX_CHIP_BUY_USDC = 100;
-
+    /// Most USDC all $CHIP buys together may spend in 24h (hard limit $2,000 in the contract).
+    uint256 internal constant DAILY_CHIP_BUY_USDC = 300;
     /// First mint by the Safe: $125 of each of the 8 stocks ($1,000) for 100 index tokens ($10).
     uint256 internal constant SEED_USD_PER_STOCK = 125;
     uint256 internal constant SEED_TOKENS = 100;
@@ -62,25 +64,24 @@ library Addrs {
     address internal constant POOL_MANAGER = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
     address internal constant CHIP_HOOK = 0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544;
     address internal constant POLICY_REGISTRY = 0x8453000000000000000000000000000000000002;
-    uint24 internal constant CHIP_POOL_FEE = 0x800000; // dynamic-fee flag
+    address internal constant B20_FACTORY = 0xB20f000000000000000000000000000000000000;
+    /// Owner of all 8 Coinbase stock feeds and the ETH/USD feed (Chainlink's Base multisig),
+    /// read onchain 2026-10-13. The registry takes it from the first launch feed; verify checks it.
+    address internal constant CHAINLINK_FEED_OWNER = 0xf0Db7318A51a21C413CaDd4AbDC1E8a500fE5B1b;    uint24 internal constant CHIP_POOL_FEE = 0x800000; // dynamic-fee flag
     int24 internal constant CHIP_POOL_TS = 200;
     int24 internal constant STOCK_USDC_TS = 10; // every B20/USDC pool with real depth
     int24 internal constant WETH_USDC_TS = 50; // deepest Aerodrome WETH/USDC pool
 
-    function basket() internal pure returns (BasketRegistry.AssetConfig[] memory c, int24[] memory ts) {
+    function basket() internal pure returns (BasketRegistry.AssetConfig[] memory c) {
         c = new BasketRegistry.AssetConfig[](8);
-        c[0] = BasketRegistry.AssetConfig(0xb20000000000000000000078ee7ce2fE4908108C, 0x04689a41629776563E6822F76f2e57D148d28513, 1_250); // NVDA
-        c[1] = BasketRegistry.AssetConfig(0xb2000000000000000000004884b426556b92883d, 0xB3cE282CD188b35DA0E38D8Bc7d58e33173D202a, 1_250); // MSTR
-        c[2] = BasketRegistry.AssetConfig(0xb2000000000000000000002D0BA3164cc74f58B7, 0x5bF49E0ffA937CE2FfF033c739aD7C634c4D34F2, 1_250); // GOOGL
-        c[3] = BasketRegistry.AssetConfig(0xb200000000000000000000d9192b6B456483C2E8, 0x06A8E4b3aBB3B7543d8396FB2B763d22820cB295, 1_250); // AMZN
-        c[4] = BasketRegistry.AssetConfig(0xb200000000000000000000C2e324d24d7eEcd1fb, 0x787f13dEa48Db0897CbCDD985de77809D837F988, 1_250); // AAPL
-        c[5] = BasketRegistry.AssetConfig(0xb2000000000000000000008bC8786B856E61707C, 0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D, 1_250); // META
-        c[6] = BasketRegistry.AssetConfig(0xb2000000000000000000001e800a7f5189430cD0, 0xFaf869185383a24F8cb00e27BdA6b63B9905DCb4, 1_250); // TSLA
-        c[7] = BasketRegistry.AssetConfig(0xB200000000000000000000Ab99cFa739E253872B, 0xeB10A6c9aa7E537aEd766C08c35Dae35B321b18c, 1_250); // MSFT
-        ts = new int24[](8);
-        for (uint256 i; i < 8; ++i) {
-            ts[i] = STOCK_USDC_TS;
-        }
+        c[0] = BasketRegistry.AssetConfig(0xb20000000000000000000078ee7ce2fE4908108C, 0x04689a41629776563E6822F76f2e57D148d28513, 1_250, STOCK_USDC_TS); // NVDA
+        c[1] = BasketRegistry.AssetConfig(0xb2000000000000000000004884b426556b92883d, 0xB3cE282CD188b35DA0E38D8Bc7d58e33173D202a, 1_250, STOCK_USDC_TS); // MSTR
+        c[2] = BasketRegistry.AssetConfig(0xb2000000000000000000002D0BA3164cc74f58B7, 0x5bF49E0ffA937CE2FfF033c739aD7C634c4D34F2, 1_250, STOCK_USDC_TS); // GOOGL
+        c[3] = BasketRegistry.AssetConfig(0xb200000000000000000000d9192b6B456483C2E8, 0x06A8E4b3aBB3B7543d8396FB2B763d22820cB295, 1_250, STOCK_USDC_TS); // AMZN
+        c[4] = BasketRegistry.AssetConfig(0xb200000000000000000000C2e324d24d7eEcd1fb, 0x787f13dEa48Db0897CbCDD985de77809D837F988, 1_250, STOCK_USDC_TS); // AAPL
+        c[5] = BasketRegistry.AssetConfig(0xb2000000000000000000008bC8786B856E61707C, 0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D, 1_250, STOCK_USDC_TS); // META
+        c[6] = BasketRegistry.AssetConfig(0xb2000000000000000000001e800a7f5189430cD0, 0xFaf869185383a24F8cb00e27BdA6b63B9905DCb4, 1_250, STOCK_USDC_TS); // TSLA
+        c[7] = BasketRegistry.AssetConfig(0xB200000000000000000000Ab99cFa739E253872B, 0xeB10A6c9aa7E537aEd766C08c35Dae35B321b18c, 1_250, STOCK_USDC_TS); // MSFT
     }
 }
 
@@ -109,6 +110,7 @@ contract Deploy is Script {
         string symbol;
         uint256 mintCap; // 18-dec index tokens
         uint256 maxChipBuyUsdc; // 6-dec USDC
+        uint256 dailyChipBuyUsdc; // 6-dec USDC
     }
 
     uint16 internal constant REDEEM_FEE_BPS = LaunchConfig.REDEEM_FEE_BPS;
@@ -129,7 +131,8 @@ contract Deploy is Script {
             name: LaunchConfig.NAME,
             symbol: LaunchConfig.SYMBOL,
             mintCap: LaunchConfig.MINT_CAP_TOKENS * 1e18,
-            maxChipBuyUsdc: LaunchConfig.MAX_CHIP_BUY_USDC * 1e6
+            maxChipBuyUsdc: LaunchConfig.MAX_CHIP_BUY_USDC * 1e6,
+            dailyChipBuyUsdc: LaunchConfig.DAILY_CHIP_BUY_USDC * 1e6
         });
     }
 
@@ -146,8 +149,9 @@ contract Deploy is Script {
     }
 
     function deploy(Params memory p) public returns (Deployed memory d) {
-        (BasketRegistry.AssetConfig[] memory cfg, int24[] memory ts) = Addrs.basket();
-        d.registry = new BasketRegistry(Addrs.SAFE, Addrs.SEQUENCER_FEED, Addrs.SLIP_FACTORY, Addrs.USDC, cfg, ts);
+        d.registry = new BasketRegistry(
+            Addrs.SAFE, Addrs.SEQUENCER_FEED, Addrs.SLIP_FACTORY, Addrs.USDC, Addrs.B20_FACTORY, Addrs.basket()
+        );
         d.vault = new IndexVault(
             Addrs.SAFE,
             d.registry,
@@ -185,7 +189,8 @@ contract Deploy is Script {
                 chipPoolKey: PoolKey(Addrs.WETH, Addrs.CHIP, Addrs.CHIP_POOL_FEE, Addrs.CHIP_POOL_TS, Addrs.CHIP_HOOK),
                 wethUsdcTickSpacing: Addrs.WETH_USDC_TS,
                 keeper: Addrs.KEEPER,
-                maxChipBuyUsdc: p.maxChipBuyUsdc
+                maxChipBuyUsdc: p.maxChipBuyUsdc,
+                dailyChipBuyUsdc: p.dailyChipBuyUsdc
             })
         );
         d.registry.wireVault(address(d.vault));
@@ -226,13 +231,19 @@ contract Deploy is Script {
         require(d.splitter.pot() == Addrs.POT, "pot");
         require(address(d.splitter.burner()) == Addrs.CHIP_BURNER, "burner");
         require(d.splitter.maxChipBuyUsdc() == p.maxChipBuyUsdc, "chip buy cap");
+        require(d.splitter.dailyChipBuyUsdc() == p.dailyChipBuyUsdc, "daily chip buy cap");
+        require(d.vault.maxTradeSlippageBps() == 75, "trade slippage 0.75%");
+        require(d.vault.dailyTradeCapBps() == 1_500 && d.vault.dailyLossCapBps() == 10, "daily trade caps");
+        require(d.registry.trustedFeedOwner() == Addrs.CHAINLINK_FEED_OWNER, "trusted feed owner");
+        require(address(d.registry.b20Factory()) == Addrs.B20_FACTORY, "b20 factory");
 
-        (BasketRegistry.AssetConfig[] memory cfg,) = Addrs.basket();
+        BasketRegistry.AssetConfig[] memory cfg = Addrs.basket();
         require(d.registry.assetCount() == cfg.length, "basket size");
         for (uint256 i; i < cfg.length; ++i) {
             BasketRegistry.Asset memory a = d.registry.assetAt(i);
             require(a.token == cfg[i].token && a.feed == cfg[i].feed && a.weightBps == 1_250, "basket entry");
             require(a.tokenDecimals == 8 && a.feedDecimals == 8, "decimals");
+            require(d.registry.usdcTickSpacing(a.token) == Addrs.STOCK_USDC_TS, "pool");
         }
     }
 

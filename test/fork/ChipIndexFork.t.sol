@@ -49,6 +49,8 @@ abstract contract ChipIndexForkBase is Test {
     address constant POOL_MANAGER = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
     address constant CHIP_HOOK = 0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544;
     address constant POLICY_REGISTRY = 0x8453000000000000000000000000000000000002;
+    address constant B20_FACTORY = 0xB20f000000000000000000000000000000000000;
+    address constant CHAINLINK_FEED_OWNER = 0xf0Db7318A51a21C413CaDd4AbDC1E8a500fE5B1b;
     address constant POLICY_ADMIN = 0xEC0F05C174e54FBf0Fe16ad930a8AFEbCe612812;
     uint64 constant COINBASE_BLOCKLIST = 5;
     int24 constant STOCK_TS = 10;
@@ -104,12 +106,10 @@ abstract contract ChipIndexForkBase is Test {
         _freshenFeeds();
 
         BasketRegistry.AssetConfig[] memory cfg = new BasketRegistry.AssetConfig[](N);
-        int24[] memory ts = new int24[](N);
         for (uint256 i; i < N; ++i) {
-            cfg[i] = BasketRegistry.AssetConfig(tokens[i], feedAddrs[i], 1_250);
-            ts[i] = STOCK_TS;
+            cfg[i] = BasketRegistry.AssetConfig(tokens[i], feedAddrs[i], 1_250, STOCK_TS);
         }
-        registry = new BasketRegistry(SAFE, SEQUENCER_FEED, SLIP_FACTORY, USDC, cfg, ts);
+        registry = new BasketRegistry(SAFE, SEQUENCER_FEED, SLIP_FACTORY, USDC, B20_FACTORY, cfg);
         vault = new IndexVault(SAFE, registry, POLICY_REGISTRY, "Chip Index", "CHIPX", _launchMintFees(), 100, 300, 1_000_000e18);
         rebalancer = new Rebalancer(SAFE, vault, ISlipstreamRouter(SLIP_ROUTER), USDC, KEEPER);
         router = new IndexRouter(
@@ -130,7 +130,8 @@ abstract contract ChipIndexForkBase is Test {
                 chipPoolKey: PoolKey(WETH, CHIP, 0x800000, 200, CHIP_HOOK),
                 wethUsdcTickSpacing: WETH_USDC_TS,
                 keeper: KEEPER,
-                maxChipBuyUsdc: 10_000e6
+                maxChipBuyUsdc: 500e6,
+                dailyChipBuyUsdc: 2_000e6
             })
         );
         registry.wireVault(address(vault));
@@ -359,6 +360,10 @@ contract ChipIndexForkTest is ChipIndexForkBase {
     /// Coinbase blocklists the VAULT: nothing can move, but redeem still burns and credits.
     function test_fork_blocklistedVault() public {
         _setBlocked(address(vault), true);
+        // Item 3: mint refused up front with the vault blocklisted.
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.Blocklisted.selector, address(vault), tokens[0]));
+        vault.mint(1e18, alice);
         vm.prank(SAFE);
         uint256[] memory out = vault.redeem(10e18, SAFE);
         for (uint256 i; i < N; ++i) {
@@ -376,6 +381,13 @@ contract ChipIndexForkTest is ChipIndexForkBase {
         f[0] = IB20.PausableFeature.TRANSFER;
         nvda.pause(f);
         assertTrue(nvda.isPaused(IB20.PausableFeature.TRANSFER));
+
+        // Item 3: every mint is refused up front while a stock is paused.
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.StockPaused.selector, tokens[0]));
+        vault.requireMintable();
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IndexVault.StockPaused.selector, tokens[0]));
+        vault.mint(1e18, alice);
 
         vm.prank(SAFE);
         uint256[] memory out = vault.redeem(10e18, alice);
@@ -459,8 +471,9 @@ contract ChipIndexForkTest is ChipIndexForkBase {
     function test_fork_rebalanceSwapHasChainlinkMinimum() public {
         _give(tokens[0], address(vault), registry.amountForUsd(tokens[0], 60e18));
         vault.sync(tokens[0]);
+        // 90% of MSTR's gap to target, so MSTR does not overshoot.
         Rebalancer.Trade[] memory t = new Rebalancer.Trade[](1);
-        t[0] = Rebalancer.Trade(tokens[0], tokens[1], registry.amountForUsd(tokens[0], 50e18), 0);
+        t[0] = Rebalancer.Trade(tokens[0], tokens[1], registry.amountForUsd(tokens[0], _underUsd(1) * 90 / 100), 0);
         uint256 deadline = block.timestamp + 600;
 
         uint256 snap = vm.snapshotState();
@@ -479,7 +492,49 @@ contract ChipIndexForkTest is ChipIndexForkBase {
         console2.log("swap minimum / MSTR received", minOut, vault.held(tokens[1]) - mstrBefore);
         assertGe(vault.held(tokens[1]) - mstrBefore, minOut);
         console2.log("NAV before / after rebalance with swap minimum", navBefore, vault.navUsd());
-        assertGe(vault.navUsd() * 10_000, navBefore * 9_900, "lost at most 1% of the traded value");
+        assertGe(vault.navUsd() * 10_000, navBefore * 9_925, "lost at most 0.75% of the traded value");
+    }
+
+    /// Dollars (18 dec) stock `j` is below its target; 0 if it is not underweight.
+    function _underUsd(uint256 j) internal view returns (uint256) {
+        (, int256[] memory d) = rebalancer.drifts();
+        return d[j] < 0 ? uint256(-d[j]) * vault.navUsd() / 1e18 : 0;
+    }
+
+    /// Item 4 on the real chain: the launch basket passes the authenticity checks (setUp), and
+    /// fakes are refused when the Safe queues them.
+    function test_fork_basketRejectsFakes() public {
+        assertEq(registry.trustedFeedOwner(), CHAINLINK_FEED_OWNER, "Chainlink's Base multisig");
+        BasketRegistry.AssetConfig[] memory cfg = new BasketRegistry.AssetConfig[](N);
+        for (uint256 i; i < N; ++i) {
+            cfg[i] = BasketRegistry.AssetConfig(tokens[i], feedAddrs[i], 1_250, STOCK_TS);
+        }
+
+        // 1. A plain ERC-20 posing as MSFT (not created by Base's B20 factory).
+        FakeStock fake = new FakeStock();
+        cfg[7].token = address(fake);
+        vm.prank(SAFE);
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.NotB20.selector, address(fake)));
+        registry.queueBasket(cfg);
+
+        // 2. Real NVDA paired with MSTR's real feed.
+        cfg[7] = BasketRegistry.AssetConfig(tokens[7], feedAddrs[7], 1_250, STOCK_TS);
+        cfg[0].feed = feedAddrs[1];
+        vm.prank(SAFE);
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.FeedDoesNotMatchToken.selector, tokens[0], feedAddrs[1]));
+        registry.queueBasket(cfg);
+
+        // 3. A look-alike feed: right description, claims Chainlink's owner, different code.
+        LookAlikeChainlinkFeed look = new LookAlikeChainlinkFeed(CHAINLINK_FEED_OWNER);
+        cfg[0].feed = address(look);
+        vm.prank(SAFE);
+        vm.expectRevert(abi.encodeWithSelector(BasketRegistry.UntrustedFeed.selector, address(look)));
+        registry.queueBasket(cfg);
+
+        // The genuine basket queues fine.
+        cfg[0].feed = feedAddrs[0];
+        vm.prank(SAFE);
+        registry.queueBasket(cfg);
     }
 
     /// Make `feed` read `pct`% of its current answer (still fresh).
@@ -518,8 +573,11 @@ contract ChipIndexForkTest is ChipIndexForkBase {
         assertTrue(ok);
 
         uint256 navBefore = vault.navUsd();
-        Rebalancer.Trade[] memory t = new Rebalancer.Trade[](1);
-        t[0] = Rebalancer.Trade(tokens[0], tokens[1], registry.amountForUsd(tokens[0], 50e18), 0);
+        // Sell NVDA into each of the 7 underweight stocks, 95% of each one's gap (no overshoot).
+        Rebalancer.Trade[] memory t = new Rebalancer.Trade[](N - 1);
+        for (uint256 j = 1; j < N; ++j) {
+            t[j - 1] = Rebalancer.Trade(tokens[0], tokens[j], registry.amountForUsd(tokens[0], _underUsd(j) * 95 / 100), 0);
+        }
         vm.prank(KEEPER);
         rebalancer.rebalance(t, block.timestamp + 600);
 
@@ -624,5 +682,33 @@ contract ChipIndexForkTest is ChipIndexForkBase {
 
     function test_fork_smallMint_eth5() public {
         _smallEthMint(0.5e18);
+    }
+}
+
+/// @notice A plain ERC-20 with a Coinbase-style name, for the authenticity test.
+contract FakeStock {
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    function symbol() external pure returns (string memory) {
+        return "MSFTc";
+    }
+}
+
+/// @notice Answers like a Chainlink proxy and names Chainlink's owner, but is not their code.
+contract LookAlikeChainlinkFeed {
+    address public immutable owner;
+
+    constructor(address o) {
+        owner = o;
+    }
+
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    function description() external pure returns (string memory) {
+        return "Coinbase NVDA";
     }
 }

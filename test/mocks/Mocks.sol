@@ -69,6 +69,11 @@ contract MockB20 is MockERC20 {
         transfersPaused = p;
     }
 
+    /// @dev base-std IB20.isPaused: feature 0 = TRANSFER.
+    function isPaused(uint8 feature) external view returns (bool) {
+        return feature == 0 && transfersPaused;
+    }
+
     /// @dev Convenience: block `a` under THIS token's policy.
     function setBlocked(address a, bool b) external {
         policies.setBlocked(policy, a, b);
@@ -126,13 +131,31 @@ contract MockAggregator {
         broken = b;
     }
 
-    function description() external pure returns (string memory) {
-        return "mock";
+    /// @dev Every MockAggregator has the same code hash and, deployed by one fixture, the same
+    ///      owner, like the real Chainlink proxies (one code, one owner: Chainlink's Base multisig).
+    address public owner = msg.sender;
+    string public description = "mock";
+
+    function setDescription(string calldata d) external {
+        description = d;
+    }
+
+    function setOwner(address o) external {
+        owner = o;
     }
 
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
         require(!broken, "feed broken");
         return (1, answer, startedAt, updatedAt, 1);
+    }
+}
+
+/// @notice Base's B20 factory stand-in: answers isB20Initialized for tokens a test registers.
+contract MockB20Factory {
+    mapping(address => bool) public isB20Initialized;
+
+    function setB20(address token, bool b) external {
+        isB20Initialized[token] = b;
     }
 }
 

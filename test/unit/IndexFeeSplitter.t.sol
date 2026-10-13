@@ -2,6 +2,7 @@
 pragma solidity 0.8.24;
 
 import {IndexFeeSplitter} from "../../src/IndexFeeSplitter.sol";
+import {Settings} from "../../src/lib/Settings.sol";
 import {Fixture} from "../Fixture.sol";
 import {MockERC20} from "../mocks/Mocks.sol";
 
@@ -90,8 +91,9 @@ contract IndexFeeSplitterTest is Fixture {
         vm.expectRevert(abi.encodeWithSelector(IndexFeeSplitter.OverBudget.selector, budget + 1, budget));
         splitter.buyAndBurn(budget + 1, 1, deadline);
 
+        uint8 capKey = splitter.SET_MAX_CHIP_BUY();
         vm.prank(safe);
-        splitter.setMaxChipBuyUsdc(1e6);
+        splitter.tighten(capKey, 1e6);
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(IndexFeeSplitter.OverCap.selector, 2e6, 1e6));
         splitter.buyAndBurn(2e6, 1, deadline);
@@ -108,6 +110,62 @@ contract IndexFeeSplitterTest is Fixture {
         vm.prank(alice);
         vm.expectRevert(IndexFeeSplitter.NotKeeper.selector);
         splitter.buyAndBurn(1e6, 1, deadline);
+    }
+
+    /// The per-call cap has a hard limit of $500; raising it waits 48h, lowering is instant.
+    function test_chipBuyCap_hardLimitAndTimelock() public {
+        uint8 k = splitter.SET_MAX_CHIP_BUY();
+        vm.startPrank(safe);
+        vm.expectRevert(abi.encodeWithSelector(IndexFeeSplitter.OverCap.selector, 500e6 + 1, 500e6));
+        splitter.queueSetting(k, 500e6 + 1);
+        splitter.tighten(k, 100e6);
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, k, 200e6));
+        splitter.tighten(k, 200e6);
+        splitter.queueSetting(k, 200e6);
+        vm.warp(block.timestamp + 48 hours);
+        splitter.executeSetting(k, 200e6);
+        vm.stopPrank();
+        assertEq(splitter.maxChipBuyUsdc(), 200e6);
+    }
+
+    /// At most dailyChipBuyUsdc of $CHIP buys per 24h, however the calls are split.
+    function test_chipBuy_dailyCap() public {
+        splitter.redeemFees();
+        _sellAll();
+        uint8 perCall = splitter.SET_MAX_CHIP_BUY();
+        uint8 daily = splitter.SET_DAILY_CHIP_BUY();
+        vm.startPrank(safe);
+        splitter.tighten(perCall, 5e6);
+        splitter.tighten(daily, 12e6);
+        vm.stopPrank();
+        assertGe(splitter.chipBudget(), 20e6);
+
+        vm.startPrank(keeper);
+        splitter.buyAndBurn(5e6, 1, deadline);
+        splitter.buyAndBurn(5e6, 1, deadline);
+        vm.expectRevert(abi.encodeWithSelector(IndexFeeSplitter.OverDailyCap.selector, 15e6, 12e6));
+        splitter.buyAndBurn(5e6, 1, deadline);
+        splitter.buyAndBurn(2e6, 1, deadline); // exactly up to the cap
+        vm.stopPrank();
+
+        _warpFresh(1 days);
+        vm.prank(keeper);
+        splitter.buyAndBurn(5e6, 1, block.timestamp + 1 hours); // a new day
+    }
+
+    /// Removing a keeper is instant; installing one waits 48h.
+    function test_keeper_removeInstantAddTimelocked() public {
+        uint8 k = splitter.SET_KEEPER();
+        vm.startPrank(safe);
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, k, uint256(uint160(bob))));
+        splitter.tighten(k, uint160(bob));
+        splitter.tighten(k, 0);
+        assertEq(splitter.keeper(), address(0));
+        splitter.queueSetting(k, uint160(bob));
+        vm.warp(block.timestamp + 48 hours);
+        splitter.executeSetting(k, uint160(bob));
+        vm.stopPrank();
+        assertEq(splitter.keeper(), bob);
     }
 
     function test_unlockCallbackOnlyPoolManager() public {

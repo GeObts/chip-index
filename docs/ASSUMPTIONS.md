@@ -20,8 +20,10 @@ always favours existing holders. The fuzz tests check that a mint-then-redeem ro
 
 ## A-3 Redeem can never be paused
 Redeem has no pause flag and no oracle or freshness check. The only owner levers on the vault are
-mint pause, mint cap, fee rates (hard-capped), and 48h-timelocked changes of the rebalancer and fee
-recipient. A stock leg that cannot be delivered is credited to `creditTo` and claimable later with
+mint pause, mint cap, fee rates (hard-capped), trade limits, and 48h-timelocked changes of the
+rebalancer and fee recipient. Every setting that could cost holders money (raising a fee, cap or
+limit, adding a keeper, choosing a pool, a longer feed age) waits 48h; only stricter values are
+instant (`lib/Settings`). A stock leg that cannot be delivered is credited to `creditTo` and claimable later with
 `claimOwed`.
 
 ## A-4 Coinbase (issuer) powers, which no contract can remove
@@ -54,7 +56,7 @@ can therefore move index tokens to a clean address that then redeems. This is ac
 index token a normal composable ERC-20.
 
 ## A-7 Fees
-- Mint 1% / redeem 1% (cap 2% each). Taken in index tokens and sent to the IndexFeeSplitter; the
+- Mint 1% / redeem 1% (mint every tier capped at 1%, redeem capped at 2%; cuts instant, rises 48h). Taken in index tokens and sent to the IndexFeeSplitter; the
   fee recipient itself redeems fee-free.
 - Management fee 3%/yr (cap 5%), accrued per second on every mint/redeem/`accrue` (Base blocks are
   2s) as newly minted index tokens. Continuous minting dilutes holders by about 2.96% of value a year.
@@ -64,12 +66,20 @@ index token a normal composable ERC-20.
   and `maxChipBuyUsdc` per call.
 
 ## A-8 Keeper powers
-The keeper (`0x6571…95B9`) can rebalance (only within the drift/schedule rules and vault-enforced
-slippage), sell fee stocks (with a Chainlink floor), buy and burn $CHIP (budget and per-call cap),
+The keeper (`0x6571…95B9`) can rebalance (only within the drift/schedule rules, never pushing a
+stock past its target, selling at most the basket's overweight per rebalance, and inside the
+vault's 0.75% per-trade and 24h caps of 15% of NAV traded and 0.10% of NAV lost), sell fee stocks
+(with a Chainlink floor), buy and burn $CHIP (budget, $100 per call, $300 per 24h),
 and pause the Router's cash paths (only the Safe unpauses). It cannot touch user funds, the in-kind
-paths, fees, the basket or ownership.
+paths, fees, the basket or ownership. Worst case with a stolen keeper key: REVIEW_RESPONSE §11.
 
-## A-9 Testing
+## A-9 Basket authenticity
+Adding a stock is checked onchain: real B20 (Base's B20 factory), Chainlink feed (same code and
+owner as the launch feeds), feed description `Coinbase <TICKER>` for symbol `<TICKER>c`, and an
+existing pool. Who issued a B20 cannot be checked onchain, so the Safe matches every new token
+address against api.coinbase.com/v1/tokenized-stocks before queueing; the 48h lets others check.
+
+## A-10 Testing
 B20 stocks are precompiles: under stock `forge` their code is the single byte `0xef` and every
 call fails. The fork suite runs under Base's `base-forge` (base-anvil v1.1.0), which executes the
 real precompiles against real fork state. Issuer actions in tests (pause role, operator role) are

@@ -5,6 +5,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {IndexRouter} from "../../src/IndexRouter.sol";
 import {IndexVault} from "../../src/IndexVault.sol";
+import {Settings} from "../../src/lib/Settings.sol";
 import {Fixture} from "../Fixture.sol";
 
 contract IndexRouterTest is Fixture {
@@ -232,9 +233,48 @@ contract IndexRouterTest is Fixture {
     }
 
     function test_slippageCap() public {
-        vm.prank(safe);
+        uint8 k = router.SET_LEG_SLIPPAGE();
+        vm.startPrank(safe);
         vm.expectRevert(abi.encodeWithSelector(IndexRouter.SlippageAboveCap.selector, uint16(101)));
-        router.setLegSlippageBps(101);
+        router.queueSetting(k, 101);
+        router.tighten(k, 50); // tighter: instant
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, k, 100));
+        router.tighten(k, 100); // looser: 48h
+        vm.stopPrank();
+        assertEq(router.legSlippageBps(), 50);
+    }
+
+    /// Choosing a different WETH/USDC pool is never instant, and the pool must exist.
+    function test_poolChoice_timelockOnly() public {
+        uint8 k = router.SET_WETH_USDC_TICK_SPACING();
+        factory.setPool(address(weth), address(usdc), 100);
+        vm.startPrank(safe);
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, k, 100));
+        router.tighten(k, 100);
+        vm.expectRevert(abi.encodeWithSelector(IndexRouter.NoSuchPool.selector, int24(200)));
+        router.queueSetting(k, 200);
+        router.queueSetting(k, 100);
+        vm.warp(block.timestamp + 48 hours);
+        router.executeSetting(k, 100);
+        vm.stopPrank();
+        assertEq(router.wethUsdcTickSpacing(), 100);
+    }
+
+    /// Keeper: removal instant, a new keeper after 48h; ETH feed age: longer after 48h.
+    function test_keeperAndEthFeedAge() public {
+        uint8 kk = router.SET_KEEPER();
+        uint8 age = router.SET_ETH_FEED_MAX_AGE();
+        vm.startPrank(safe);
+        router.tighten(kk, 0);
+        assertEq(router.keeper(), address(0));
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, kk, uint256(uint160(bob))));
+        router.tighten(kk, uint160(bob));
+        router.tighten(age, 30 minutes);
+        vm.expectRevert(abi.encodeWithSelector(Settings.NotATightening.selector, age, 2 hours));
+        router.tighten(age, 2 hours);
+        router.queueSetting(age, 2 hours);
+        vm.stopPrank();
+        assertEq(router.ethFeedMaxAge(), 30 minutes);
     }
 
     function test_onlyWethMaySendEth() public {
