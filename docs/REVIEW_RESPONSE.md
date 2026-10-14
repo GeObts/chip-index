@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-13. **Reviews:** round 1: ChatGPT (findings 1–2, plus 7 questions) and Bankr
 (M-1, M-2, L-1, L-2, L-3); round 2: Bankr's second review and a second round-2 review (§13); round
-3: a third review with no critical or high findings (§14); final review: ChatGPT F-01 (§16).
+3: a third review with no critical or high findings (§14); final review: ChatGPT F-01 (§16); owner change, 24/7 cash mint/redeem (§17).
 Nothing is deployed or pushed. Every change below is in local commits only.
 
 > **Reviewer IDs still to be matched.** The review texts have not been received yet (they were
@@ -38,6 +38,7 @@ Nothing is deployed or pushed. Every change below is in local commits only.
 | R | Round 3: use Chainlink USDC/USD in the Router instead of $1? | round 3 | **Costed, not implemented** (owner to decide) (§14.2) |
 | K / M | Basket authenticity | round 3 | **Accepted - handled operationally: addresses taken from Coinbase's official list and checked by VerifyDeployment.s.sol** (and since round 2 also enforced onchain, §13.2) |
 | S | Final review: mint, redeem, claim, executeTrade and fee redemption used the stored `held` / credit books without checking real balances, so after an issuer seizure and before anyone called `sync` a redeemer was paid from the stale, too-high book and could drain what was left | **ChatGPT F-01** | **Fixed** (§16) |
+| T | Owner change: the stocks trade 24/7, so cash mint/redeem must work while the Chainlink feeds are frozen (nights, weekends, holidays) | owner, 2026-10-14 | **Done** (§17) |
 
 ## 2. Fix A — credits share a seizure pro-rata (IndexVault)
 
@@ -704,3 +705,80 @@ four fail: someone overpaid, the books were not covered, and the last holder cou
 - **Base mainnet fork: 47 passed, 0 failed** (was 40).
   - New: 7 F-01 fork tests.
 - No existing test needed a change.
+
+## 17. Cash mint/redeem 24/7 (owner change, 2026-10-14)
+
+Tokenized stocks trade 24/7; the Chainlink stock feeds freeze nights, weekends and holidays.
+Until now the Router refused every cash mint and redeem while any feed was stale.
+
+### 17.1 Why holders are not exposed (confirmed before changing anything)
+
+- The vault never reads a price to mint or redeem. A mint of `shares` must deliver
+  `ceil(held × shares / supply)` of every stock and creates exactly `shares` CHIPX (the user's
+  part plus the mint fee to the fee splitter). A redeem pays `floor(held × net / supply)` and moves
+  the fee shares to the fee splitter. Both roundings favour the holders who stay.
+- The Router's USDC/ETH trades on Aerodrome happen outside the vault, with the user's own money:
+  it buys the exact stock a mint needs, or sells the stock a redeem paid out.
+- So a cash mint or redeem at a bad price can only cost that user, never existing holders: their
+  stock per CHIPX cannot go down.
+- The only price-based input to the vault is the mint fee tier, and with frozen feeds it falls back
+  to the base 1% (no fresh price, no discount). The vault's NAV uses Chainlink, not the pools, so
+  moving a pool does not move the NAV. The Rebalancer, which trades holders' stock on the same
+  pools, still requires fresh feeds and a Chainlink-derived minimum on every swap.
+
+### 17.2 The change (IndexRouter only)
+
+| | Every feed the call reads is fresh | Any of them frozen |
+|---|---|---|
+| Per-leg check | within `legSlippageBps` (1%) of the current Chainlink price, as before | within `staleBandBps` (**10%**) of the LAST Chainlink price, which must be at most 7 days old |
+| User's limit | max in / min out, as before | the same, and a cash redeem must name a **nonzero** min-out (`ZeroMinOut`) |
+| Mint fee | size-tiered | base 1% |
+| Sequencer | must be up, 1h grace | the same |
+
+- "The call reads": the 8 stock feeds, plus ETH/USD for ETH mint/redeem.
+- The 10% band only blocks fat-finger and broken-pool fills. Why 10%: a normal weekend gap in the
+  pools is a few percent, so 10% leaves room for that, while a pool 15% away is refused.
+- Settings (the same rules as the other Router settings): the Safe can lower the band instantly,
+  and raise it again only through the 48h timelock, never above 10%. `tighten(SET_STALE_BAND, 0)`
+  switches stale-feed cash trading off (`StaleCashOff`). VerifyDeployment checks 10% at launch
+  (151 checks now).
+- `band(bool usesEth)` is public, so a front end can show which mode applies.
+- The Rebalancer, the fee splitter and the vault are unchanged; IndexVault's bytecode is the same.
+
+### 17.3 Tests
+
+| What | Unit (mocks) | Base fork (real feeds stale, real Aerodrome) |
+|---|---|---|
+| Weekend mint and redeem, USDC and ETH | 4 tests | `test_fork_weekend_usdcMintAndRedeem` ($100.12 for 10 CHIPX, $98.03 back), `..._ethMintAndRedeem` |
+| Pool 15% off: mint reverts | USDC and ETH | NVDA's last price 15% away from its pool: USDC and ETH mints revert |
+| Pool 15% off: redeem reverts | USDC and ETH | USDC and ETH redeems revert |
+| Inside the band (8–9% off) fills, holders untouched | yes (all 4 paths) | yes |
+| Fresh feeds keep the 1% check | 1.01% off: reverts when fresh, fills when stale | 8% off with fresh feeds reverts |
+| User limits | min-out 0 refused; min-out too high and max-in too low revert | the same |
+| Fee tier falls back to 1% | yes | (tier fork tests unchanged) |
+| Last price older than 7 days, sequencer down | both revert | — |
+| Only the ETH feed stale | ETH calls go wide, USDC calls stay at 1% | — |
+| Band settings | cap 10%, lower instant, higher 48h, 0 = off | — |
+| Rebalancer on a weekend | still refuses (`StalePrice`) | still refuses |
+
+**New invariant (`CashInvariants`)**: random cash mints and redeems (USDC and ETH), pool prices
+anywhere from Chainlink to 20% worse, feeds frozen or fresh at random, prices moving ±5% when
+markets open. Around every cash call it checks that existing holders' stock per CHIPX, and NAV per
+CHIPX, never goes down. 2 invariants × 3,200 calls, 0 reverts, 0 losses. A scripted test proves
+the handler reaches fresh fills, frozen-feed fills inside the band, and refusals beyond it.
+**Mutation check:** a vault that undercharges minters by 1% fails all three.
+
+The two old tests that expected a stale feed to block cash mint were replaced by the weekend tests,
+and `test_fork_staleFeed` now expects the mint to work.
+
+### 17.4 Cost and size
+
+- IndexRouter: 18,275 bytes (6,301 under the limit). IndexVault unchanged.
+- Gas on the Base fork with fresh feeds is slightly LOWER than before (the old code checked every
+  feed twice): USDC mint + redeem −21,336, ETH mint −6,699.
+
+### 17.5 Test counts
+
+- **Unit + invariant: 185 passed, 0 failed** (was 165): +19 weekend unit tests, +3 cash invariant
+  tests, −2 replaced stale-feed tests.
+- **Base fork: 55 passed, 0 failed** (was 47): +8 weekend fork tests.

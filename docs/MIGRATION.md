@@ -53,8 +53,8 @@ also means a new vault.
 1. **Redeem from the old vault.** Either:
    - in kind: `oldVault.redeem(shares, me)` — you receive the 8 stocks directly. Works any day,
      including weekends; or
-   - to cash: `oldRouter.redeemToUsdc(...)` or `redeemToEth(...)` — needs all price feeds fresh
-     (market days), each stock sold within 1% of Chainlink.
+   - to cash: `oldRouter.redeemToUsdc(...)` or `redeemToEth(...)` — works 24/7: each stock sold
+     within 1% of Chainlink while feeds are fresh, within 10% of the last price while they are frozen.
 2. If a leg was credited instead of delivered, collect it later with `oldVault.claimOwed(token, me)`.
 3. **Mint in the new vault.** Either:
    - in kind: approve each stock to the new vault and call `newVault.mint(shares, me)`

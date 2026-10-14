@@ -39,7 +39,7 @@ contract VerifyDeploymentForkTest is Test {
         (address[] memory t, string[] memory s) = _coinbaseList(false);
         (uint256 passes, uint256 fails) = verifier.check(d, t, s);
         assertEq(fails, 0, "a clean deploy has no FAIL line");
-        assertEq(passes, 150, "all 150 checks ran");
+        assertEq(passes, 151, "all 151 checks ran");
     }
 
     /// Five planted problems, five FAIL lines.

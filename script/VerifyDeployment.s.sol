@@ -189,6 +189,7 @@ contract VerifyDeployment is Script {
         _ok(d.splitter.wethUsdcTickSpacing() == Addrs.WETH_USDC_TS, "fee splitter WETH/USDC pool");
         _ok(d.router.legSlippageBps() == 100, "router per-leg slippage 1%");
         _ok(d.router.ethFeedMaxAge() == 1 hours, "router ETH feed max age 1h");
+        _ok(d.router.staleBandBps() == 1_000, "router stale-feed band 10% (24/7 cash mint/redeem)");
         _ok(d.router.wethUsdcTickSpacing() == Addrs.WETH_USDC_TS, "router WETH/USDC pool");
         _ok(d.router.ethUsdFeed() == Addrs.ETH_USD_FEED, "router ETH/USD feed");
         _ok(!d.router.cashMintPaused() && !d.router.cashRedeemPaused(), "router USDC/ETH paths not paused");

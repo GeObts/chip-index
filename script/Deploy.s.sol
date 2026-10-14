@@ -223,6 +223,7 @@ contract Deploy is Script {
         require(address(d.rebalancer.vault()) == address(d.vault), "rebalancer -> vault");
         require(address(d.splitter.vault()) == address(d.vault), "splitter -> vault");
 
+        require(d.router.legSlippageBps() == 100 && d.router.staleBandBps() == 1_000, "router bands");
         require(d.rebalancer.keeper() == Addrs.KEEPER, "rebalancer keeper");
         require(d.router.keeper() == Addrs.KEEPER, "router keeper");
         require(d.splitter.keeper() == Addrs.KEEPER, "splitter keeper");

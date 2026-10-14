@@ -15,6 +15,7 @@ Every launch value is in ONE place: the `LaunchConfig` block at the top of `scri
 | Safe settings | stricter = instant (`tighten`); looser = 48h (`queueSetting` / `executeSetting`) | decided 2026-10-13 |
 | First mint | $125 × 8 stocks = $1,000 → 100 tokens ($10 each) | decided |
 | Fees | mint 1%, redeem 1%, management 3%/yr | decided |
+| Cash mint/redeem hours | 24/7. Fresh feeds: each leg within 1% of Chainlink. Stale feeds: within 10% of the last Chainlink price (≤ 7 days old), redeem needs a nonzero min-out, mint fee base 1%. `router.tighten(4, x)` narrows the band instantly; `tighten(4, 0)` turns stale-feed cash off | decided 2026-10-14 |
 | Blocklist | refuse redeem/claim for Coinbase-blocklisted accounts | decided, built |
 | Independent review | `docs/REVIEW_PACKAGE.md` | before real money |
 
@@ -38,7 +39,7 @@ The deploy wallet owns nothing afterwards; the Safe owns all five contracts.
 
 ## 3a. Verify the live deployment (free, read-only, sends nothing)
 Run this right after the deploy, and again any time you want to confirm nothing has drifted. It
-needs no key. It prints one `PASS` or `FAIL` line per check (150 checks for the launch basket)
+needs no key. It prints one `PASS` or `FAIL` line per check (151 checks for the launch basket)
 and exits with an error if any line failed.
 
 In WSL, from the repo folder, fill in the five addresses the deploy printed:
@@ -57,7 +58,7 @@ CHIPX_REGISTRY=0x...  CHIPX_VAULT=0x...  CHIPX_REBALANCER=0x...  CHIPX_ROUTER=0x
 - Feed ages are printed as `INFO` (not pass/fail): they are normal up to 24h on weekends.
 - A `FAIL` on a setting the Safe changed on purpose after launch is expected. Update
   `LaunchConfig` to the new value and run it again.
-- Rehearsed on a Base fork (`test/fork/VerifyDeploymentFork.t.sol`): a clean deploy gives 150
+- Rehearsed on a Base fork (`test/fork/VerifyDeploymentFork.t.sol`): a clean deploy gives 151
   PASS and 0 FAIL; a queued change, an unaccepted ownership transfer, a removed keeper and a stock
   missing from Coinbase's list give exactly 5 FAIL lines.
 

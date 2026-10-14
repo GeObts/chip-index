@@ -21,18 +21,29 @@ import {Settings} from "./lib/Settings.sol";
  *         leg on Aerodrome Slipstream. It holds nothing between calls and has no special power
  *         over the vault: it uses the same public `mint`/`redeem` anyone can.
  *
- *         Protection on every call:
+ *         Cash mint and redeem work 24/7 (the stocks trade 24/7; the Chainlink feeds freeze
+ *         nights, weekends and holidays). Protection on every call:
  *         - the user's own limit (max USDC/ETH in, or min USDC/ETH out), and
- *         - each leg must trade within `legSlippageBps` (max 1%) of the Chainlink price.
- *         Cash mints AND cash redeems need every feed fresh. When feeds are frozen
- *         (weekends, holidays) use the vault's in-kind redeem, which never stops.
+ *         - a per-leg band against Chainlink:
+ *           FRESH (every stock feed fresh, and the ETH feed for ETH calls): each leg within
+ *             `legSlippageBps` (max 1%) of the current price;
+ *           STALE (any of those frozen): each leg within `staleBandBps` (default and max 10%) of
+ *             the LAST Chainlink price (at most STALE_PRICE_MAX_AGE old), which only blocks
+ *             fat-finger or broken-pool fills; a cash redeem must also name a nonzero min-out.
+ *
+ *         Why a wide band is safe for holders: the vault prices nothing. A mint must deliver
+ *         `held * shares / supply` of every stock (rounded up) for exactly `shares` CHIPX, and a
+ *         redeem pays `held * net / supply` (rounded down). The USDC/ETH a user pays or receives
+ *         for those stocks is the user's own trade, so a bad fill can only cost that user.
+ *         The Rebalancer, which trades holders' stock, still needs every feed fresh.
  *
  *         Cash redeems refuse issuer-blocklisted callers and recipients (see IndexVault BLOCKLIST).
  *
  *         Assumes 1 USDC = $1 when comparing USDC against the stock feeds.
  *
- *         Settings (lib/Settings): SET_KEEPER, SET_LEG_SLIPPAGE, SET_ETH_FEED_MAX_AGE (lower is
- *         instant, higher is 48h; removing the keeper is instant, adding one is 48h) and
+ *         Settings (lib/Settings): SET_KEEPER, SET_LEG_SLIPPAGE, SET_ETH_FEED_MAX_AGE,
+ *         SET_STALE_BAND (lower is instant, higher is 48h; `tighten(SET_STALE_BAND, 0)` switches
+ *         stale-feed cash trading off; removing the keeper is instant, adding one is 48h) and
  *         SET_WETH_USDC_TICK_SPACING (pool choice: 48h only). Pausing (owner or keeper) and
  *         unpausing (owner) stay instant.
  */
@@ -43,11 +54,16 @@ contract IndexRouter is Settings, ReentrancyGuard {
     uint16 public constant MAX_LEG_SLIPPAGE_BPS = 100; // 1%
     uint256 public constant MIN_ETH_FEED_AGE = 5 minutes;
     uint256 public constant MAX_ETH_FEED_AGE = 24 hours;
+    /// Wide band used while feeds are frozen: blocks fat-finger and broken-pool fills only.
+    uint16 public constant MAX_STALE_BAND_BPS = 1_000; // 10%
+    /// Oldest "last price" the wide band may lean on (a long weekend plus a holiday is ~4 days).
+    uint256 public constant STALE_PRICE_MAX_AGE = 7 days;
 
     uint8 public constant SET_KEEPER = 0;
     uint8 public constant SET_LEG_SLIPPAGE = 1;
     uint8 public constant SET_ETH_FEED_MAX_AGE = 2;
     uint8 public constant SET_WETH_USDC_TICK_SPACING = 3;
+    uint8 public constant SET_STALE_BAND = 4;
 
     IndexVault public immutable vault;
     BasketRegistry public immutable registry;
@@ -61,6 +77,7 @@ contract IndexRouter is Settings, ReentrancyGuard {
     int24 public wethUsdcTickSpacing;
     uint16 public legSlippageBps = MAX_LEG_SLIPPAGE_BPS;
     uint256 public ethFeedMaxAge = 1 hours;
+    uint16 public staleBandBps = MAX_STALE_BAND_BPS;
     bool public cashMintPaused;
     bool public cashRedeemPaused;
 
@@ -83,6 +100,16 @@ contract IndexRouter is Settings, ReentrancyGuard {
     error SpentAboveMax(uint256 spent, uint256 max);
     error OutputBelowMin(uint256 out, uint256 min);
     error OnlyWeth();
+    error ZeroMinOut();
+    error StaleCashOff();
+
+    /// @dev How one call prices its legs: `bps` band around Chainlink, feeds read up to these ages.
+    struct Band {
+        uint16 bps;
+        uint256 stockAge;
+        uint256 ethAge;
+        bool fresh;
+    }
 
     constructor(
         address owner_,
@@ -125,7 +152,7 @@ contract IndexRouter is Settings, ReentrancyGuard {
         nonReentrant
         returns (uint256 usdcSpent)
     {
-        _checkMint(deadline);
+        Band memory b = _checkMint(deadline, false);
         uint256 before = usdc.balanceOf(address(this));
         usdc.safeTransferFrom(msg.sender, address(this), maxUsdcIn);
         usdc.forceApprove(address(swapRouter), maxUsdcIn);
@@ -141,7 +168,7 @@ contract IndexRouter is Settings, ReentrancyGuard {
                     recipient: address(this),
                     deadline: deadline,
                     amountOut: amounts[i],
-                    amountInMaximum: _maxUsdcFor(list[i], amounts[i]),
+                    amountInMaximum: _maxUsdcFor(list[i], amounts[i], b),
                     sqrtPriceLimitX96: 0
                 })
             );
@@ -163,8 +190,8 @@ contract IndexRouter is Settings, ReentrancyGuard {
         nonReentrant
         returns (uint256 ethSpent)
     {
-        _checkMint(deadline);
-        uint256 ethUsd = _ethPrice();
+        Band memory b = _checkMint(deadline, true);
+        uint256 ethUsd = _ethPrice(b);
         uint256 before = weth.balanceOf(address(this));
         IWETH(address(weth)).deposit{value: msg.value}();
         weth.forceApprove(address(swapRouter), msg.value);
@@ -172,7 +199,7 @@ contract IndexRouter is Settings, ReentrancyGuard {
         (address[] memory list, uint256[] memory amounts) = vault.previewMint(shares);
         for (uint256 i; i < list.length; ++i) {
             if (amounts[i] == 0) continue;
-            uint256 maxWeth = _withSlippageUp(_wethForUsd(registry.valueUsd(list[i], amounts[i]), ethUsd, true));
+            uint256 maxWeth = _up(_wethForUsd(_valueUsd(list[i], amounts[i], b), ethUsd, true), b);
             swapRouter.exactOutput(
                 ISlipstreamRouter.ExactOutputParams({
                     // exactOutput paths are reversed: tokenOut first.
@@ -210,7 +237,7 @@ contract IndexRouter is Settings, ReentrancyGuard {
         nonReentrant
         returns (uint256 usdcOut)
     {
-        _checkRedeem(deadline, to);
+        Band memory b = _checkRedeem(deadline, to, minUsdcOut, false);
         (address[] memory list, uint256[] memory got) = _redeemHere(shares);
         uint256 before = usdc.balanceOf(address(this));
         for (uint256 i; i < list.length; ++i) {
@@ -224,7 +251,7 @@ contract IndexRouter is Settings, ReentrancyGuard {
                     recipient: address(this),
                     deadline: deadline,
                     amountIn: got[i],
-                    amountOutMinimum: _minUsdcFor(list[i], got[i]),
+                    amountOutMinimum: _minUsdcFor(list[i], got[i], b),
                     sqrtPriceLimitX96: 0
                 })
             );
@@ -241,13 +268,13 @@ contract IndexRouter is Settings, ReentrancyGuard {
         nonReentrant
         returns (uint256 ethOut)
     {
-        _checkRedeem(deadline, to);
-        uint256 ethUsd = _ethPrice();
+        Band memory b = _checkRedeem(deadline, to, minEthOut, true);
+        uint256 ethUsd = _ethPrice(b);
         (address[] memory list, uint256[] memory got) = _redeemHere(shares);
         uint256 before = weth.balanceOf(address(this));
         for (uint256 i; i < list.length; ++i) {
             if (got[i] == 0) continue;
-            uint256 minWeth = _withSlippageDown(_wethForUsd(registry.valueUsd(list[i], got[i]), ethUsd, false));
+            uint256 minWeth = _down(_wethForUsd(_valueUsd(list[i], got[i], b), ethUsd, false), b);
             IERC20(list[i]).forceApprove(address(swapRouter), got[i]);
             swapRouter.exactInput(
                 ISlipstreamRouter.ExactInputParams({
@@ -308,6 +335,8 @@ contract IndexRouter is Settings, ReentrancyGuard {
             if (v < MIN_ETH_FEED_AGE || v > MAX_ETH_FEED_AGE) revert FeedAgeOutOfBounds(v);
         } else if (key == SET_WETH_USDC_TICK_SPACING) {
             _requirePool(v);
+        } else if (key == SET_STALE_BAND) {
+            if (v > MAX_STALE_BAND_BPS) revert SlippageAboveCap(uint16(v > type(uint16).max ? type(uint16).max : v));
         } else {
             revert UnknownSetting(key);
         }
@@ -318,6 +347,7 @@ contract IndexRouter is Settings, ReentrancyGuard {
         if (key == SET_LEG_SLIPPAGE) return legSlippageBps;
         if (key == SET_ETH_FEED_MAX_AGE) return ethFeedMaxAge;
         if (key == SET_WETH_USDC_TICK_SPACING) return uint24(wethUsdcTickSpacing);
+        if (key == SET_STALE_BAND) return staleBandBps;
         revert UnknownSetting(key);
     }
 
@@ -325,6 +355,7 @@ contract IndexRouter is Settings, ReentrancyGuard {
         if (key == SET_KEEPER) keeper = address(uint160(v));
         else if (key == SET_LEG_SLIPPAGE) legSlippageBps = uint16(v);
         else if (key == SET_ETH_FEED_MAX_AGE) ethFeedMaxAge = v;
+        else if (key == SET_STALE_BAND) staleBandBps = uint16(v);
         else wethUsdcTickSpacing = int24(uint24(v));
     }
 
@@ -339,20 +370,40 @@ contract IndexRouter is Settings, ReentrancyGuard {
     /*                             Internals                               */
     /* ------------------------------------------------------------------ */
 
-    function _checkMint(uint256 deadline) internal view {
+    function _checkMint(uint256 deadline, bool usesEth) internal view returns (Band memory) {
         if (block.timestamp > deadline) revert Expired(deadline);
         if (cashMintPaused) revert CashMintIsPaused();
-        registry.requireAllFresh(); // never mint at a stale price
+        return band(usesEth);
     }
 
-    function _checkRedeem(uint256 deadline, address to) internal view {
+    function _checkRedeem(uint256 deadline, address to, uint256 minOut, bool usesEth)
+        internal
+        view
+        returns (Band memory b)
+    {
         if (block.timestamp > deadline) revert Expired(deadline);
         if (cashRedeemPaused) revert CashRedeemIsPaused();
         if (to == address(0)) revert ZeroAddress();
-        registry.requireAllFresh();
+        b = band(usesEth);
+        if (!b.fresh && minOut == 0) revert ZeroMinOut(); // the user's own limit is required when stale
         // The vault checks the caller (as credit holder) and this router; the cash recipient is
         // checked here, so a blocklisted account cannot redeem through a clean address or vice versa.
         vault.requireNotBlocked(to);
+    }
+
+    /// @notice The band a cash call would use right now: tight (`legSlippageBps` around the
+    ///         current price) when every feed it reads is fresh, else wide (`staleBandBps` around
+    ///         the last price). Reverts while the sequencer is down or in its grace hour, and
+    ///         with StaleCashOff when stale-feed trading is switched off (staleBandBps == 0).
+    function band(bool usesEth) public view returns (Band memory b) {
+        OracleLib.checkSequencer(registry.sequencerFeed());
+        b.fresh = registry.allFresh() && (!usesEth || OracleLib.isFresh(ethUsdFeed, ethFeedMaxAge));
+        if (b.fresh) {
+            (b.bps, b.stockAge, b.ethAge) = (legSlippageBps, registry.maxFeedAge(), ethFeedMaxAge);
+        } else {
+            if (staleBandBps == 0) revert StaleCashOff();
+            (b.bps, b.stockAge, b.ethAge) = (staleBandBps, STALE_PRICE_MAX_AGE, STALE_PRICE_MAX_AGE);
+        }
     }
 
     /// @dev Pull the user's index tokens, redeem in kind to this contract (credits go to the user),
@@ -370,9 +421,15 @@ contract IndexRouter is Settings, ReentrancyGuard {
         }
     }
 
-    function _ethPrice() internal view returns (uint256) {
-        OracleLib.checkSequencer(registry.sequencerFeed());
-        return OracleLib.read(ethUsdFeed, ethFeedMaxAge);
+    function _ethPrice(Band memory b) internal view returns (uint256) {
+        return OracleLib.read(ethUsdFeed, b.ethAge);
+    }
+
+    /// @dev USD value (18 dec) of `amount` raw units at the Chainlink price, read up to `b.stockAge` old.
+    function _valueUsd(address token, uint256 amount, Band memory b) internal view returns (uint256) {
+        BasketRegistry.Asset memory a = registry.asset(token);
+        uint256 p = OracleLib.read(a.feed, b.stockAge) * 10 ** (18 - a.feedDecimals);
+        return Math.mulDiv(amount, p, 10 ** a.tokenDecimals);
     }
 
     /// @dev WETH (18 dec) worth `usd18` dollars at `ethUsd` (feed decimals).
@@ -383,22 +440,21 @@ contract IndexRouter is Settings, ReentrancyGuard {
     }
 
     /// @dev Most USDC (6 dec) a leg buying `amount` of `token` may cost.
-    function _maxUsdcFor(address token, uint256 amount) internal view returns (uint256) {
-        uint256 usd6 = Math.mulDiv(registry.valueUsd(token, amount), 1, 1e12, Math.Rounding.Ceil);
-        return _withSlippageUp(usd6);
+    function _maxUsdcFor(address token, uint256 amount, Band memory b) internal view returns (uint256) {
+        return _up(Math.mulDiv(_valueUsd(token, amount, b), 1, 1e12, Math.Rounding.Ceil), b);
     }
 
     /// @dev Least USDC (6 dec) a leg selling `amount` of `token` must return.
-    function _minUsdcFor(address token, uint256 amount) internal view returns (uint256) {
-        return _withSlippageDown(registry.valueUsd(token, amount) / 1e12);
+    function _minUsdcFor(address token, uint256 amount, Band memory b) internal view returns (uint256) {
+        return _down(_valueUsd(token, amount, b) / 1e12, b);
     }
 
-    function _withSlippageUp(uint256 x) internal view returns (uint256) {
-        return Math.mulDiv(x, BPS + legSlippageBps, BPS, Math.Rounding.Ceil);
+    function _up(uint256 x, Band memory b) internal pure returns (uint256) {
+        return Math.mulDiv(x, BPS + b.bps, BPS, Math.Rounding.Ceil);
     }
 
-    function _withSlippageDown(uint256 x) internal view returns (uint256) {
-        return x * (BPS - legSlippageBps) / BPS;
+    function _down(uint256 x, Band memory b) internal pure returns (uint256) {
+        return x * (BPS - b.bps) / BPS;
     }
 
     function _requirePool(uint256 v) internal view {

@@ -79,7 +79,7 @@ These come from the B20 tokens themselves and cannot be removed by any contract.
 | Issuer **pause** (TRANSFER/MINT/BURN/SEIZE, per token) | A paused stock's redeem leg is credited and claimable later; mint is refused up front (`StockPaused`) while any stock's TRANSFER is paused. | `test_fork_pausedToken`, `test_redeem_pausedTokenIsCreditedThenClaimed` |
 | Issuer **seize** from any holder, including the vault | The loss is written down pro-rata across index holders (`held`) and credit holders (`totalOwed`, scaling every credit at once). This happens automatically at the start of every mint, redeem, claim and rebalance trade (F-01), or by anyone through `sync` / `reconcile`. | 6 unit seizure tests incl. fuzz, 14 F-01 tests, 4 seizure invariants (no `sync`), invariant handler, 7 F-01 fork tests, `test_fork_seizureWithOutstandingCredit` |
 | **Multiplier** changes (dividends, splits) | None: balances are raw and the feeds are total-return. | `test_fork_multiplierChange` (10× change) |
-| **Feeds freeze** nights, weekends, holidays and corporate actions | Cash mint/redeem, rebalancing and fee selling stop; in-kind paths continue. | `test_fork_staleFeed` |
+| **Feeds freeze** nights, weekends, holidays and corporate actions | Rebalancing and fee selling stop. Cash mint/redeem continue 24/7 inside a 10% band around the last Chainlink price, plus the user's own limit (nonzero min-out on redeem); in-kind paths continue. | `test_fork_staleFeed`, `WeekendCashFork` (8) |
 | **Denim** upgrade (Sepolia 2026-10-21, mainnet planned November 2026) applies the executor check to plain `transfer` | Executor and sender share policy 5 (a BLOCKLIST) on all 8 stocks, so for a plain `transfer` it asks the same question again: no change while our contracts are not blocklisted. Only an allowlist-style executor policy would stop stock movement (here and on every DEX). | Checked onchain; ASSUMPTIONS A-4 |
 | **Wrapper vs blocklist** | Owner decision: the vault refuses redeem and claim for any blocklisted caller, receiver or credit holder, and the router also checks the cash recipient. | 7 unit + 6 fork tests (§6) |
 
@@ -105,7 +105,7 @@ redeem/claim checks on their own terms, not as a complete compliance barrier.
   |---|---|---|
   | IndexVault | mint pause/unpause; lower: redeem fee, mgmt fee, mint cap, trade slippage, daily trade cap, daily loss cap | raise any of those (hard caps 2%, 5%/yr, —, 1%, 25%, 0.5%); mint fee schedule; rebalancer; fee recipient |
   | BasketRegistry | shorter feed max age | longer feed max age (≤72h); basket incl. pool choice; trusted feed owner / code hash; Coinbase token register address |
-  | IndexRouter | pause (owner or keeper), unpause (owner); remove keeper; lower leg slippage; shorter ETH feed age | add keeper; raise leg slippage (≤1%); longer ETH feed age (≤24h); WETH/USDC pool |
+  | IndexRouter | pause (owner or keeper), unpause (owner); remove keeper; lower leg slippage; shorter ETH feed age; lower stale-feed band (0 = stale cash off) | add keeper; raise leg slippage (≤1%); longer ETH feed age (≤24h); raise stale-feed band (≤10%); WETH/USDC pool |
   | Rebalancer | remove keeper | add keeper |
   | IndexFeeSplitter | remove keeper; lower $CHIP per-call cap, daily cap, sell slippage; shorter ETH feed age | add keeper; raise per-call cap (≤$500), daily cap (≤$2,000), sell slippage (≤2%); longer ETH feed age; WETH/USDC pool |
 
@@ -127,13 +127,13 @@ redeem/claim checks on their own terms, not as a complete compliance barrier.
 
 ## 6. Test results (2026-10-12, re-run after review rounds 1–3, 2026-10-13)
 
-**Unit + invariant (mocks): 165 passed, 0 failed.** `forge test --no-match-path "test/fork/*"`
+**Unit + invariant (mocks): 185 passed, 0 failed.** `forge test --no-match-path "test/fork/*"`
 
 | Suite | Tests | Covers |
 |---|---|---|
 | IndexVault | 41 | seed, pro-rata mint/redeem, fees and caps (cut instant, rise 48h), management accrual, credits, pause, **mint refused while a stock is paused or the vault blocklisted (2)**, mint cap rise 48h, vault-blocklisted stock, **blocklist (5)**, sync, **seizure with credits outstanding (6)**, trade slippage and daily caps, timelocks, 3 fuzz tests (512 runs) |
 | MintFeeTiers | 19 | just under / at / just over $10k and $50k (±$0.01), small mint, per-mint (not cumulative), USDC and ETH router mints get the tier, stale feed → mint works at 1%, redeem stays 1% at $60k, timelock (early, mismatched data, owner-only), caps (101 bps rejected on each rate, bad thresholds, constructor), donation attack on a tier (loses $2,062 to save $117.50), stale feed only moves the tier boundary |
-| IndexRouter | 21 | USDC/ETH mint and redeem, 1% leg bound, user limits, stale feeds, pause roles, credits go to the user, **blocklist (2)**, ETH-rejecting wallet gets WETH (2), settings (slippage, keeper, ETH feed age, pool 48h-only) |
+| IndexRouter | 19 | USDC/ETH mint and redeem, 1% leg bound, user limits, pause roles, credits go to the user, **blocklist (2)**, ETH-rejecting wallet gets WETH (2), settings (slippage, keeper, ETH feed age, pool 48h-only) |
 | BasketRegistry | 23 | launch basket, validation, timelock delay/grace/mismatch/cancel, add/remove/prune (refused while held or owed), **authenticity: fake token, B20 not registered by Coinbase (queue and execute), untrusted or look-alike feed, feed/ticker mismatch, re-checked at execute (5)**, Coinbase register address 48h-only, pool change is a basket change, feed max age, trusted feed owner 48h-only, stale/bad/broken feeds, sequencer |
 | Rebalancer | 13 | eligibility (drift / 30 days), over/underweight rules, **buyer overshoot refused, over-budget refused**, Chainlink minimum on the swap, vault slippage, keeper minOut, removed ticker |
 | IndexFeeSplitter | 11 | fee-free redeem, 50/50 split, oracle floor, buy-and-burn, caps, zero `minChipOut` refused, **$CHIP per-call hard limit and 48h raise, daily cap**, keeper remove/add, sweep limits |
@@ -144,9 +144,11 @@ redeem/claim checks on their own terms, not as a complete compliance barrier.
 | Credit invariants | 4 | **12 creditors, repeated seizures, tiny credits (to 1 wei), claims in random order**: paid + owed ≤ credited per stock; balance covers books; credits add up; everyone can claim and redeem everything |
 | SeizureNoSync (F-01) | 14 | **no `sync` anywhere**: seize then redeem (50%, 90%, 100%: true share only, the last one out is paid), seize then mint (exact real slice, fee tier on the real NAV), seize then rebalance (normal and hostile), seize with credits outstanding then claim/redeem in both orders, donation then mint/redeem (unchanged), synced donation keeps the tier honest, seizure + donation, gas |
 | Seizure invariants (F-01) | 4 | seizures and donations at random, **never synced**, fail-on-revert ON: no payout above the true share of actual balances; every mint pays exactly the true share; books covered after any action; everyone can exit |
+| Weekend cash (24/7) | 19 | stale stock feeds: USDC/ETH mint and redeem work at the base 1% fee; pool 15% off reverts (all 4 paths); 9% off fills and holders lose nothing; fresh feeds keep 1%; nonzero min-out on redeem; user max-in/min-out; last price > 7 days, sequencer down; only-ETH-feed-stale; band settings (cap 10%, 0 = off); Rebalancer still refuses |
+| Cash invariants | 3 | random cash mints/redeems, pools 0–20% worse, feeds frozen or fresh: holders' stock and NAV per CHIPX never drop; scripted coverage of fresh fills, frozen fills and refusals |
 | Hostile Rebalancer | 5 | **an attacker's Rebalancer contract** trying every trade shape, re-entry, wrong-token payment, price moves: loss ≤ 0.10% of NAV per window and ≤ 0.20% per 24h; no re-entry; books covered; worst case $49.99/window, $99.93/24h at $50k NAV |
 
-**Base mainnet fork (real B20s, feeds, Aerodrome, $CHIP v4 pool, ChipBurner): 47 passed, 0 failed.**
+**Base mainnet fork (real B20s, feeds, Aerodrome, $CHIP v4 pool, ChipBurner): 55 passed, 0 failed.**
 `./script/fork-test.sh` (base-forge)
 
 | Test | Result |
@@ -155,11 +157,12 @@ redeem/claim checks on their own terms, not as a complete compliance barrier.
 | Deploy script + Safe seed batch | launch config verified (incl. the real launch basket passing every authenticity check); seed spent $1,000.59 → NAV $10.00/token |
 | Basket authenticity (real chain) | a plain ERC-20 named MSFTc, NVDA with MSTR's feed, and a look-alike feed naming Chainlink's owner are all refused; the genuine basket queues |
 | Copycat B20 (real chain) | a REAL B20 made through Base's factory with MSFT's name, symbol, decimals, policy 5 and Coinbase's role holders passes the factory, role and OracleRegistry checks, and is refused (`NotCoinbaseIssued`) because Coinbase's TokenSupplyManager never registered it |
-| VerifyDeployment script (2) | real deploy script on the fork: 150 PASS / 0 FAIL; five planted problems give exactly 5 FAIL lines |
+| VerifyDeployment script (2) | real deploy script on the fork: 151 PASS / 0 FAIL (150 before the 24/7 band check); five planted problems give exactly 5 FAIL lines |
+| Weekend cash (8) | real feeds stale (+60h): USDC mint $100.12 for 10 CHIPX and $98.03 back, ETH mint/redeem; a stale last price 15% off its pool makes USDC and ETH mints and redeems revert; 8% off fills with holders untouched (and reverts with fresh feeds); zero/too-high min-out refused; Rebalancer refuses |
 | In-kind mint/redeem | real B20 delivered; in-kind redeem ~416k gas incl. blocklist check |
 | Cash USDC mint/redeem | $99.95–$100.00 for 10 tokens; $97.86–$97.91 back for 9.9 |
 | Cash ETH mint | 0.0408–0.0415 ETH for 10 tokens |
-| Stale feed | cash mint refused; in-kind redeem works |
+| Stale feed | cash mint and redeem work inside the 10% band (15% off reverts); Rebalancer refuses; in-kind redeem works |
 | Blocklist (6) | receiver, caller, credit holder, cash caller/recipient refused; claim refused until lifted; lifted restores |
 | Vault blocklisted | mint refused up front; all 8 redeem legs credited, shares burned |
 | Paused token | mint refused up front (`StockPaused`); 7 legs delivered, NVDA credited, claimed after unpause |
@@ -273,7 +276,7 @@ Tested from a clean unzip on Ubuntu (WSL) on 2026-10-13, with a fresh HOME (noth
 step below passed. Needs `git` and `curl`.
 
 Forge 1.8.x reports each invariant suite as ONE test, with its invariants listed inside it, so its
-unit count reads lower than forge 1.7.x (165). Every invariant still runs.
+unit count reads lower than forge 1.7.x (185). Every invariant still runs.
 
 **1. Foundry (stock) for build, unit and invariant tests.**
 ```
@@ -293,7 +296,7 @@ forge install --no-git \
 **3. Build and unit/invariant tests** (no network needed).
 ```
 forge build --sizes
-forge test --no-match-path "test/fork/*"          # expect 165 passed (forge 1.7.x); fewer lines on 1.8.x
+forge test --no-match-path "test/fork/*"          # expect 185 passed (forge 1.7.x); fewer lines on 1.8.x
 FOUNDRY_PROFILE=deep forge test --no-match-path "test/fork/*" --match-path "test/invariant/*"   # optional, ~8 min
 ```
 
@@ -317,7 +320,7 @@ wrapper that runs the Base build with `FOUNDRY_BASE=true`.
 **5. Fork tests** (40, against live Base mainnet state, ~3 minutes).
 ```
 export BASE_RPC_URL=https://mainnet.base.org     # or your own Base RPC; the public one works but is slow
-./script/fork-test.sh                             # expect 47 passed
+./script/fork-test.sh                             # expect 55 passed
 ./script/fork-test.sh --match-contract MintTierForkTest -vv   # the per-stock slippage logs in §6
 ```
 Fork results depend on live pool and feed state, so dollar figures will differ slightly from §6.

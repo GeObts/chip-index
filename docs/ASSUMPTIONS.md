@@ -10,8 +10,11 @@ Facts below were verified onchain or against Coinbase/Base sources on 2026-10-12
 - Feeds update on a 0.5% move or a 24h heartbeat, 24/5, and freeze nights, weekends, holidays and
   corporate actions. "Stale" = `updatedAt` older than `maxFeedAge` (default 26h, settable 1h–72h).
   On a weekday some feeds were 9h old with markets open, so a tight limit would block normal use.
-- Cash mint/redeem, rebalancing and fee selling all need fresh feeds and a live sequencer
-  (Base sequencer uptime feed, 1h grace). **In-kind mint and redeem never read a price.**
+- Rebalancing and fee selling need fresh feeds and a live sequencer (Base sequencer uptime feed,
+  1h grace). Cash mint/redeem need only the live sequencer: they run 24/7, within 1% of Chainlink
+  when every feed they read is fresh, else within 10% of the last Chainlink price (at most 7 days
+  old) plus the user's own limit (owner decision 2026-10-14). **In-kind mint and redeem never read
+  a price**, so a bad cash fill only costs that user, never holders.
 - 1 USDC is treated as $1 in the Router.
 
 ## A-2 In-kind mint/redeem are pro-rata

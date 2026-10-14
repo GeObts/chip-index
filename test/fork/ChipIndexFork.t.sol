@@ -260,7 +260,7 @@ contract ChipIndexForkTest is ChipIndexForkBase {
         assertEq(IERC20(WETH).balanceOf(address(router)), 0);
     }
 
-    /// Stale feeds stop cash mints; in-kind redeem keeps working.
+    /// Stale feeds: cash mint still works (wide band, see WeekendCashFork); in-kind redeem too.
     function test_fork_staleFeed() public {
         vm.clearMockedCalls(); // back to the real updatedAt values
         vm.warp(block.timestamp + 27 hours);
@@ -269,9 +269,9 @@ contract ChipIndexForkTest is ChipIndexForkBase {
         deal(USDC, alice, 1_000e6);
         vm.startPrank(alice);
         IERC20(USDC).approve(address(router), type(uint256).max);
-        vm.expectRevert();
         router.mintWithUsdc(10e18, 200e6, alice, block.timestamp + 600);
         vm.stopPrank();
+        assertEq(vault.balanceOf(alice), 9.9e18);
 
         vm.prank(SAFE);
         vault.redeem(10e18, SAFE);

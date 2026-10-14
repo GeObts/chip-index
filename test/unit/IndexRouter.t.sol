@@ -53,15 +53,7 @@ contract IndexRouterTest is Fixture {
         router.mintWithUsdc(10e18, 1_000e6, alice, deadline);
     }
 
-    function test_mintWithUsdc_blockedWhenAnyFeedStale() public {
-        vm.warp(block.timestamp + 27 hours);
-        for (uint256 i = 1; i < N; ++i) {
-            feeds[i].setUpdatedAt(block.timestamp);
-        }
-        vm.prank(alice);
-        vm.expectRevert();
-        router.mintWithUsdc(10e18, 1_000e6, alice, block.timestamp + 1);
-    }
+    // Stale feeds no longer block cash mint/redeem: see test/unit/WeekendCash.t.sol.
 
     function test_mintWithUsdc_expired() public {
         vm.prank(alice);
@@ -80,16 +72,6 @@ contract IndexRouterTest is Fixture {
         assertEq(alice.balance, balBefore - spent, "unspent ETH refunded");
         assertEq(vault.balanceOf(alice), 9.9e18);
         _assertRouterEmpty();
-    }
-
-    function test_mintWithEth_staleEthFeed() public {
-        vm.warp(block.timestamp + 2 hours);
-        for (uint256 i; i < N; ++i) {
-            feeds[i].setUpdatedAt(block.timestamp);
-        }
-        vm.prank(alice);
-        vm.expectRevert();
-        router.mintWithEth{value: 1 ether}(10e18, alice, block.timestamp + 1);
     }
 
     /* ----------------------------- redeem ---------------------------- */
