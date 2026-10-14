@@ -53,9 +53,14 @@ interface IRebalanceCallback {
  *         unavailable to blocklisted accounts: it is the issuer's rule, not an admin switch here.
  *
  *         ACCOUNTING: `held[token]` is the vault's own book of what backs the index. Credits
- *         (`totalOwed`) are kept separately and are not index backing. `sync` re-reads the real
- *         balance, so donations go to holders and an issuer seizure is written down pro-rata for
- *         index holders and credit holders alike.
+ *         (`totalOwed`) are kept separately and are not index backing. If the issuer seizes stock
+ *         from the vault, the real balance drops below `held + totalOwed`. Every action that pays
+ *         out or prices against the books (mint, redeem, claimOwed, executeTrade) first re-reads
+ *         the real balance of every listed stock and writes any shortfall down pro-rata for index
+ *         holders and credit holders alike, so nobody is ever paid from the stale, too-high book.
+ *         The views (previewMint, previewRedeem, navUsd, owed) show the same written-down figures.
+ *         This write-down never reverts and never pauses redeem. A SURPLUS (a donation) is NOT
+ *         folded in automatically: only an explicit `sync` gives it to index holders.
  *
  *         FEES (index tokens to `feeRecipient`): a mint fee and a redeem fee, both owner-settable
  *         under a hard cap, plus a management fee accrued continuously as newly minted index tokens.
@@ -258,7 +263,8 @@ contract IndexVault is ERC20, Settings, ReentrancyGuard {
         amounts = new uint256[](list.length);
         if (supply == 0) return (list, amounts);
         for (uint256 i; i < list.length; ++i) {
-            amounts[i] = Math.mulDiv(held[list[i]], shares, supply, Math.Rounding.Ceil);
+            (uint256 h,) = _live(list[i]);
+            amounts[i] = Math.mulDiv(h, shares, supply, Math.Rounding.Ceil);
         }
     }
 
@@ -270,6 +276,7 @@ contract IndexVault is ERC20, Settings, ReentrancyGuard {
         if (to == address(0)) revert ZeroAddress();
         if (totalSupply() == 0) revert NotSeeded();
         _requireMintable();
+        _reconcileAll();
         _accrue();
 
         // Priced before the deposit lands, against the same supply previewMint uses.
@@ -326,7 +333,8 @@ contract IndexVault is ERC20, Settings, ReentrancyGuard {
         amounts = new uint256[](list.length);
         if (supply == 0) return (list, amounts, fee);
         for (uint256 i; i < list.length; ++i) {
-            amounts[i] = Math.mulDiv(held[list[i]], net, supply);
+            (uint256 h,) = _live(list[i]);
+            amounts[i] = Math.mulDiv(h, net, supply);
         }
     }
 
@@ -345,6 +353,7 @@ contract IndexVault is ERC20, Settings, ReentrancyGuard {
         if (shares == 0) revert ZeroShares();
         if (receiver == address(0) || creditTo == address(0)) revert ZeroAddress();
         _requireNotBlocked(msg.sender, receiver, creditTo);
+        _reconcileAll();
         _accrue();
 
         address[] memory list;
@@ -368,8 +377,11 @@ contract IndexVault is ERC20, Settings, ReentrancyGuard {
     }
 
     /// @notice Collect a credited leg once the token can move again. Sends to `to`.
+    ///         Credits only exist on listed tokens (the registry cannot drop a token while
+    ///         `totalOwed` is above zero), so reconciling the listed tokens covers this one.
     function claimOwed(address token, address to) external nonReentrant returns (uint256 amount) {
         if (to == address(0)) revert ZeroAddress();
+        _reconcileAll();
         amount = owed(msg.sender, token);
         if (amount == 0) revert NothingOwed();
         if (isBlocked(msg.sender, token)) revert Blocklisted(msg.sender, token);
@@ -381,11 +393,13 @@ contract IndexVault is ERC20, Settings, ReentrancyGuard {
         emit OwedClaimed(msg.sender, token, to, amount);
     }
 
-    /// @notice What `account` can claim of `token` right now, after any seizure write-down.
+    /// @notice What `account` can claim of `token` right now, after any seizure write-down
+    ///         (including one not yet written to storage).
     function owed(address account, address token) public view returns (uint256) {
         uint256 s = _owedShares[account][token];
         if (s == 0 || _owedEpoch[account][token] != owedEpoch[token]) return 0;
-        return Math.mulDiv(s, totalOwed[token], totalOwedShares[token]);
+        (, uint256 o) = _live(token);
+        return Math.mulDiv(s, o, totalOwedShares[token]);
     }
 
     /// @dev New credits buy pool shares at the current scale, rounded down, so they never dilute
@@ -481,33 +495,75 @@ contract IndexVault is ERC20, Settings, ReentrancyGuard {
     }
 
     /// @notice Re-read the real balance of a listed token. Permissionless.
-    ///         - Balance above the books (a donation): the surplus goes to index holders.
-    ///         - Balance below the books (an issuer seizure): the loss is shared pro-rata between
-    ///           index holders (`held`) and credit holders (`totalOwed`, which scales every
-    ///           account's credit at once). Both round down, so held + totalOwed <= balance.
+    ///         - Balance above the books (a donation): the surplus goes to index holders. This is
+    ///           the ONLY way a surplus is folded in.
+    ///         - Balance below the books (an issuer seizure): the same write-down every action
+    ///           already applies on its own (see `_writeDown`).
     function sync(address token) external nonReentrant {
         if (!registry.isListed(token)) revert NotListed(token);
         uint256 bal = IERC20(token).balanceOf(address(this));
         uint256 h = held[token];
         uint256 o = totalOwed[token];
-        uint256 newHeld;
-        if (bal >= h + o) {
-            newHeld = bal - o;
-        } else {
-            newHeld = Math.mulDiv(h, bal, h + o);
-            uint256 newOwed = Math.mulDiv(o, bal, h + o);
-            if (newOwed != o) {
-                totalOwed[token] = newOwed;
-                if (newOwed == 0) {
-                    // Nothing left to share: retire this pool's shares.
-                    totalOwedShares[token] = 0;
-                    ++owedEpoch[token];
-                }
-                emit CreditsWrittenDown(token, o, newOwed);
+        if (bal < h + o) return _writeDown(token, h, o, bal);
+        emit Synced(token, h, bal - o);
+        held[token] = bal - o;
+    }
+
+    /// @notice Write every listed stock's books down to its real balance, if an issuer seizure
+    ///         left them short. Permissionless; never adds a surplus. Every paying action does
+    ///         this itself, so calling it is never required (the Rebalancer calls it before it
+    ///         measures drift).
+    function reconcile() external nonReentrant {
+        _reconcileAll();
+    }
+
+    function _reconcileAll() internal {
+        address[] memory list = registry.tokens();
+        for (uint256 i; i < list.length; ++i) {
+            address token = list[i];
+            (bool ok, uint256 bal) = _balance(token);
+            uint256 h = held[token];
+            uint256 o = totalOwed[token];
+            if (ok && bal < h + o) _writeDown(token, h, o, bal);
+        }
+    }
+
+    /// @dev A seizure is shared pro-rata between index holders (`held`) and credit holders
+    ///      (`totalOwed`, which scales every account's credit at once). Both round down, so
+    ///      held + totalOwed <= balance afterwards.
+    function _writeDown(address token, uint256 h, uint256 o, uint256 bal) internal {
+        (uint256 newHeld, uint256 newOwed) = _scaled(h, o, bal);
+        if (newOwed != o) {
+            totalOwed[token] = newOwed;
+            if (newOwed == 0) {
+                // Nothing left to share: retire this pool's shares.
+                totalOwedShares[token] = 0;
+                ++owedEpoch[token];
             }
+            emit CreditsWrittenDown(token, o, newOwed);
         }
         emit Synced(token, h, newHeld);
         held[token] = newHeld;
+    }
+
+    /// @dev `held` and `totalOwed` as they stand once any unrecorded shortfall is written down.
+    ///      A balance read that fails leaves the books as they are, so this never reverts.
+    function _live(address token) internal view returns (uint256 h, uint256 o) {
+        h = held[token];
+        o = totalOwed[token];
+        (bool ok, uint256 bal) = _balance(token);
+        if (ok && bal < h + o) (h, o) = _scaled(h, o, bal);
+    }
+
+    function _scaled(uint256 h, uint256 o, uint256 bal) internal pure returns (uint256, uint256) {
+        return (Math.mulDiv(h, bal, h + o), Math.mulDiv(o, bal, h + o));
+    }
+
+    function _balance(address token) internal view returns (bool ok, uint256 bal) {
+        bytes memory ret;
+        (ok, ret) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (address(this))));
+        ok = ok && ret.length >= 32;
+        if (ok) bal = abi.decode(ret, (uint256));
     }
 
     function pendingManagementFee() public view returns (uint256) {
@@ -532,6 +588,7 @@ contract IndexVault is ERC20, Settings, ReentrancyGuard {
         if (msg.sender != rebalancer) revert NotRebalancer();
         if (!registry.isListed(tokenIn)) revert NotListed(tokenIn);
         if (!registry.isListed(tokenOut)) revert NotListed(tokenOut);
+        _reconcileAll();
         uint256 h = held[tokenIn];
         if (amountIn > h) revert InsufficientHeld(tokenIn, amountIn, h);
 
@@ -582,11 +639,12 @@ contract IndexVault is ERC20, Settings, ReentrancyGuard {
     /*                          Views (NAV)                                */
     /* ------------------------------------------------------------------ */
 
-    /// @notice Total USD value of the backing, 18 decimals. Reverts if any feed is stale.
+    /// @notice Total USD value of the backing (after any unrecorded seizure), 18 decimals.
+    ///         Reverts if any feed is stale.
     function navUsd() public view returns (uint256 nav) {
         address[] memory list = registry.tokens();
         for (uint256 i; i < list.length; ++i) {
-            uint256 h = held[list[i]];
+            (uint256 h,) = _live(list[i]);
             if (h != 0) nav += registry.valueUsd(list[i], h);
         }
     }

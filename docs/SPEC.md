@@ -40,7 +40,10 @@ Addresses verified 2026-10-12 against api.coinbase.com/v1/tokenized-stocks (all 
 
 ## Known trust assumptions (B20)
 - All 8 tokens share Coinbase blocklist policy 5 on the SENDER, RECEIVER and EXECUTOR scopes. A blocklisted vault or router cannot move that token.
-- The issuer can pause transfers and seize tokens from any holder, including the vault.
+- The issuer can pause transfers and seize tokens from any holder, including the vault. A seizure
+  is written down pro-rata (index holders and credit holders alike) at the start of every mint,
+  redeem, claim and rebalance trade, so nobody is ever paid from the stale books; this never
+  reverts. Donations are folded in only by an explicit `sync`.
 - Base's Denim upgrade (mainnet planned November 2026) extends the executor check to plain
   `transfer`. All 8 stocks use the same blocklist (policy 5) for sender and executor, so nothing
   changes for the index unless Coinbase changes that (ASSUMPTIONS A-4).

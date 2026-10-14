@@ -32,8 +32,10 @@ instant (`lib/Settings`). A stock leg that cannot be delivered is credited to `c
   once**. Redeems still burn and credit, and the credits pay out if the block is lifted.
   `test_fork_blocklistedVault`.
 - The issuer can pause transfers per token (`test_fork_pausedToken`) and can seize from any holder,
-  the vault included. `sync` writes a seizure down pro-rata for index holders and credit holders
-  alike (credits are shares of a per-token pool, so every credit scales at once).
+  the vault included. A seizure is written down pro-rata for index holders and credit holders
+  alike (credits are shares of a per-token pool, so every credit scales at once). The write-down
+  happens automatically at the start of every mint, redeem, claim and rebalance trade, so nobody
+  needs to call `sync` first (ChatGPT F-01); `sync` is still how a donation is folded in.
 - Base's **Denim** upgrade (official: Sepolia October 21, 2026; mainnet "planning, November
   2026", docs.base.org/upgrades/denim/overview) applies `TRANSFER_EXECUTOR_POLICY` to plain
   `transfer` too. Checked onchain 2026-10-13: on all 8 stocks the SENDER, RECEIVER, EXECUTOR and

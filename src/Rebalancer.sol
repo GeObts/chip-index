@@ -96,6 +96,8 @@ contract Rebalancer is Settings, ReentrancyGuard, IRebalanceCallback {
         if (block.timestamp > deadline) revert Expired(deadline);
         if (trades.length == 0) revert NoTrades();
 
+        // Measure drift against the real balances: write down any issuer seizure first (F-01).
+        vault.reconcile();
         (address[] memory list, int256[] memory drift, uint256 nav) = _state();
         (uint256 maxBefore, uint256 sumBefore) = _measure(drift);
         uint256 next = uint256(lastRebalanceAt) + SCHEDULE;

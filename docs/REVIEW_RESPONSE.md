@@ -2,8 +2,8 @@
 
 **Date:** 2026-10-13. **Reviews:** round 1: ChatGPT (findings 1–2, plus 7 questions) and Bankr
 (M-1, M-2, L-1, L-2, L-3); round 2: Bankr's second review and a second round-2 review (§13); round
-3: a third review with no critical or high findings (§14). Nothing is deployed or pushed. Every
-change below is in local commits only.
+3: a third review with no critical or high findings (§14); final review: ChatGPT F-01 (§16).
+Nothing is deployed or pushed. Every change below is in local commits only.
 
 > **Reviewer IDs still to be matched.** The review texts have not been received yet (they were
 > not attached to any of the four instructions, 2026-10-13; rounds 2 and 3 arrived as the owner's
@@ -37,6 +37,7 @@ change below is in local commits only.
 | Q | Round 3: confirm Coinbase's policy types per scope; effect of Denim's executor check | round 3 | **Checked onchain**: all BLOCKLIST; no change for us (§14.1) |
 | R | Round 3: use Chainlink USDC/USD in the Router instead of $1? | round 3 | **Costed, not implemented** (owner to decide) (§14.2) |
 | K / M | Basket authenticity | round 3 | **Accepted - handled operationally: addresses taken from Coinbase's official list and checked by VerifyDeployment.s.sol** (and since round 2 also enforced onchain, §13.2) |
+| S | Final review: mint, redeem, claim, executeTrade and fee redemption used the stored `held` / credit books without checking real balances, so after an issuer seizure and before anyone called `sync` a redeemer was paid from the stale, too-high book and could drain what was left | **ChatGPT F-01** | **Fixed** (§16) |
 
 ## 2. Fix A — credits share a seizure pro-rata (IndexVault)
 
@@ -84,6 +85,10 @@ vault's balance as a seizure. The mock token has a real `seize` that ignores pau
 a seizure and the next `sync`, the books are ahead of the balance. Nothing can hook a seizure, and
 `sync` is permissionless so anyone can close that window. The invariant handler models that as
 seize-then-sync.
+
+> **Superseded by F-01 (§16).** Leaving that window open to whoever acts first was the bug ChatGPT
+> found: a redeemer could be paid from the stale book before anyone synced. Every paying action
+> now writes the shortfall down itself first, and the new invariant suite never calls `sync`.
 
 ## 3. Fix B — prune refuses outstanding credits (BasketRegistry)
 
@@ -187,6 +192,9 @@ lowers NAV, which raises fees.
      shares that loss with credit holders instead of putting it all on index holders (Fix A).
    - `sync` cannot be used to inflate any book above the balance.
    - **Fixed** (the credit part); otherwise by design.
+   - Since F-01 (§16), the downward direction no longer needs anyone to call `sync`: every paying
+     action writes a shortfall down on its own. The upward direction (folding in a donation) still
+     happens ONLY through an explicit `sync`, never automatically.
 3. **Is the deduped blocklist check correct for inverted ids and composite policies?** Yes. It
    dedupes on the policy **id** and asks the PolicyRegistry `isAuthorized(id, account)` for each
    distinct id. The registry resolves inverted (allowlist) and composite policies itself, so the
@@ -603,3 +611,96 @@ and feed ages all use `block.timestamp`.
   - The deploy rehearsal now checks the 5,000-token cap and the register.
 - Forge 1.8.x groups each invariant suite into one line, so it shows a lower unit count. Every
   invariant still runs.
+
+## 16. Final review: ChatGPT F-01 (stale books after a seizure, before `sync`)
+
+**The finding (ChatGPT F-01, correct).** `redeem`, `mint`, `claimOwed` and `executeTrade` used the
+vault's stored `held[token]` and credit pool (`totalOwed`) as they were. An issuer seizure takes
+stock out of the vault without telling it, so until someone called `sync` the books said the vault
+had more than it did. The first redeemer in that window was paid their share of the *old*, too-high
+number, which came out of everyone else's share. With a large seizure the first redeemer could take
+nearly everything that was left, and the last holder or credit holder could not be paid at all.
+The old code did exactly that in our new tests (below).
+
+### 16.1 The fix (IndexVault, Rebalancer)
+
+- **Every paying path reconciles first, for every listed stock.** `mint`, both `redeem` versions
+  (which also covers the Router's cash redeem and the FeeSplitter's `redeemFees`, since both call
+  the vault's `redeem`), `claimOwed` and `executeTrade` now start with `_reconcileAll()`. For each
+  listed stock it reads the vault's real balance and, if the balance is below `held + totalOwed`,
+  applies **the same pro-rata write-down `sync` uses**: `held` and the credit pool shrink by the
+  same fraction, both rounded down. A 100% loss retires the credit pool exactly as before.
+  `sync`'s write-down and the automatic one are now the same function (`_writeDown`).
+- **It never reverts and never pauses redeem.** The balance is read with a plain `staticcall`. If
+  that read fails, the stock's books are left as they are and the action carries on. There is no
+  new pause, owner switch or oracle read on the redeem path.
+- **Only shortfalls, never surpluses.** The automatic step only writes books DOWN. A donation is
+  left outside the books until somebody calls `sync` explicitly, exactly as before. So a donation
+  cannot change what a mint costs, which fee tier it pays, what a redeem pays or a credit's value
+  (tests 5 below). For a donation that IS synced in, REVIEW_RESPONSE §6 still holds: the tier is
+  priced at the value the minter really deposits, and the donor gives the donation away to every
+  holder.
+- **Views show the same numbers.** `previewMint`, `previewRedeem`, `navUsd`, `navPerShare`,
+  `mintFeeFor` and `owed` compute the written-down figures without writing them. The Router
+  quotes from `previewMint`, so its stock purchases match what `mint` pulls. The public `held` and
+  `totalOwed` getters stay the raw stored numbers until the next action. `BasketRegistry.prune`
+  reads them, which is the safe direction: it can only refuse a prune that a fresh write-down
+  would allow.
+- **New permissionless `reconcile()`.** It writes every listed stock down, never up. The
+  Rebalancer calls it before it measures drift, so a seizure shows up as drift and trade sizes
+  use real balances. The vault's own `executeTrade` reconciles again regardless, so a Rebalancer
+  that skips this call is still bound.
+- **Daily trade caps use the real NAV.** `executeTrade` reconciles before it opens a 24h window, so
+  the 15% traded and 0.10% lost caps are measured against what the vault really holds.
+
+### 16.2 Regression tests (none of them calls `sync`)
+
+Each was also run against the OLD vault code to prove it catches the bug.
+
+| # | Request | Unit (mocks) `test/unit/SeizureNoSync.t.sol` | Base fork `test/fork/SeizureNoSyncFork.t.sol` | Old code |
+|---|---|---|---|---|
+| 1 | Seize, then redeem: no one gets more than their true share | 50% of NVDA seized: alice gets exactly her slice of the real balance; the Safe, last out, gets the same NVDA per token. 90% seized: a holder of half the supply cannot drain the rest. 100% seized: redeem still works and pays 0 of that stock | real NVDA: paid 0.26731570, against 0.53463140 on the stale book; the Safe last out paid its share | **fails**: paid 2x the true share on the fork |
+| 2 | Seize, then mint: the minter pays the correct amount | pulls exactly ceil(real slice); not diluted; fee tier on the real NAV (stale-book $15k mint is really $7.5k: pays 1%, not 0.75%) | real B20s: pulls exactly ceil(real slice); tier priced at $187.50 (real), not $200 (stale) | **fails** |
+| 3 | Seize, then rebalance (normal and hostile Rebalancer) | normal: the seizure shows up as drift and 7 trades buy NVDA back; books equal balances; 24h caps on the real NAV. Hostile: selling stale-book NVDA is refused (`InsufficientHeld`), keeping the stock fails, a fair trade opens the window at the real NAV | the same on real Aerodrome pools (NAV $937 before and after); the hostile Rebalancer is the test contract itself, installed through the 48h timelock | **fails**: normal Rebalancer `NotEligible` (it could not see the seizure); hostile got past the vault's book check |
+| 4 | Seize with outstanding credits, then claim and redeem in both orders | claims first, or redeem first: every payout within 2 units of its true share, never above it, the same in both orders | real NVDA, paused for the credits: same result; alice's 0.16200951 credit pays 0.08100476 after half is seized | **fails**: the last claimant could not be paid (`InsufficientBalance`) |
+| 5 | Donation followed by mint and by redeem | a donation 50x the holding changes nothing: same mint cost, same fee tier, same redeem; synced donation: tier = value really deposited; seizure plus donation nets out | 20x NVDA donation: same mint cost, tier and redeem | passes (donations were never the bug) |
+
+**New invariant suite** `test/invariant/SeizureInvariants.t.sol`. Six holders mint, redeem (a
+third of the time with stocks paused, so legs are credited) and claim. The issuer seizes 0–100% and
+people donate up to 2x, at random, and **nobody ever calls `sync`**. Around every action the handler
+works out each user's fair share from the vault's ACTUAL token balances, not its books:
+
+- `invariant_noPayoutAboveTrueShare`: no redeem leg (delivered or credited) and no claim ever
+  exceeded the user's pro-rata share of the actual balance. Claims are checked two ways: each
+  claim is at most what was promised, and all promises together are at most the credit pool's
+  slice of the actual balance.
+- `invariant_mintPaysExactlyTrueShare`: every mint paid the pro-rata share of the actual balance,
+  rounded up. It never paid less (which would dilute holders) and never more (paying into a seized
+  hole).
+- `invariant_booksCoveredAfterAnyAction`: after the next action, `held + totalOwed ≤ balance`.
+- `invariant_everyoneCanExit`: every creditor claims and every holder redeems, and nothing
+  reverts.
+
+The suite runs **with fail-on-revert on**: across 32 runs × 100 calls per invariant, not one mint,
+redeem or claim reverted after a seizure. With the fix switched off (a mutation test), three of the
+four fail: someone overpaid, the books were not covered, and the last holder could not get out.
+
+### 16.3 Cost
+
+- **Gas, real Base fork (8 real B20s, in-kind):**
+  - mint: 401,083 → 429,921, **+28,838 (+7%)**;
+  - redeem: 263,644 → 296,875, **+33,231 (+13%)**.
+  - On mocks: mint +39,304, redeem +40,210.
+  - At Base's usual 0.005–0.01 gwei that is well under a cent per action. The cost is one balance
+    read per stock (the previews read it again, warm).
+  - Claims and rebalance trades pay about the same per stock.
+- **Size:** IndexVault grows from 23,064 to **23,760 bytes**, **816 bytes under** the 24,576-byte
+  limit (EIP-170). The Rebalancer grows by one call (9,802 bytes).
+
+### 16.4 Test counts after F-01
+
+- **Unit + invariant (mocks): 165 passed, 0 failed** (was 147).
+  - New: 14 F-01 unit tests and 4 seizure invariants.
+- **Base mainnet fork: 47 passed, 0 failed** (was 40).
+  - New: 7 F-01 fork tests.
+- No existing test needed a change.
