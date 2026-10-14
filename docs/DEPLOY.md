@@ -38,7 +38,7 @@ Same command plus `--broadcast --account <keystore>`, then verify the source on 
 The deploy wallet owns nothing afterwards; the Safe owns all five contracts.
 
 **LIVE on Base mainnet 2026-10-14** (commit cf0f327, deployer `0x8a424ef1…502b`, blocks
-52603406–52603412, all 7 receipts status 1, ~0.000108 ETH):
+52602894–52602900, all 7 receipts status 1, ~0.000108 ETH):
 
 | Contract | Address |
 |---|---|
