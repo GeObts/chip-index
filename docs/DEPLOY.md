@@ -79,6 +79,11 @@ Safe-only, so there is no first-depositor window.
 Re-run 2026-10-14 at 2c73b72 (24/7 cash): seed $999.36 → 100 CHIPX at $10.00; VerifyDeployment
 151 PASS / 0 FAIL; then +60h with the real stock feeds stale: USDC mint of 10 CHIPX $99.92, a
 redeem with min-out 0 refused, a redeem with min-out $90 paid $117.40 for 11.88 CHIPX.
+Launch seed $100 (14c7e9b, 2026-10-14), with the Safe's REAL 150 USDC: batch capped at $102.00,
+spent $99.88 → 10 CHIPX at $10.00; 151 PASS / 0 FAIL; weekend cash mint/redeem worked.
+Mainnet dry run as deployer `0x8a424ef1…502b` (nonce 0): registry `0x653B2cC8…004e`, vault
+`0x8d6bbB52…E9a2`, rebalancer `0xd62D1b24…35C1`, router `0xffAA57A3…7903`, splitter
+`0x791f9236…BeD6`; at most 0.000273 ETH.
 **Before the owners sign on mainnet**, simulate the exact Safe transaction against live Base
 (`eth_simulateV1`, or the Safe app's built-in simulation): base-anvil sometimes fails the first B20
 transfer it meets in a transaction (`OpcodeNotFound`), which is a simulator artefact, not a contract
