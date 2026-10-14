@@ -76,6 +76,9 @@ Full rehearsal 2026-10-13 (local base-anvil fork, deploy → seed through the re
 ($10.00 each); an $80 seed ($10 × 8, `SEED_TOKENS = 8`) spent $80.19 for 8 CHIPX; both 150 PASS /
 0 FAIL; Safe tx ~2.2M gas. Before the seed every public mint path reverts `NotSeeded` and `seed` is
 Safe-only, so there is no first-depositor window.
+Re-run 2026-10-14 at 2c73b72 (24/7 cash): seed $999.36 → 100 CHIPX at $10.00; VerifyDeployment
+151 PASS / 0 FAIL; then +60h with the real stock feeds stale: USDC mint of 10 CHIPX $99.92, a
+redeem with min-out 0 refused, a redeem with min-out $90 paid $117.40 for 11.88 CHIPX.
 **Before the owners sign on mainnet**, simulate the exact Safe transaction against live Base
 (`eth_simulateV1`, or the Safe app's built-in simulation): base-anvil sometimes fails the first B20
 transfer it meets in a transaction (`OpcodeNotFound`), which is a simulator artefact, not a contract
