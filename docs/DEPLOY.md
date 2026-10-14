@@ -37,6 +37,22 @@ ends by checking owners, wiring, policy registry, keeper, fees, cap, name/ticker
 Same command plus `--broadcast --account <keystore>`, then verify the source on Basescan.
 The deploy wallet owns nothing afterwards; the Safe owns all five contracts.
 
+**LIVE on Base mainnet 2026-10-14** (commit cf0f327, deployer `0x8a424ef1…502b`, blocks
+52603406–52603412, all 7 receipts status 1, ~0.000108 ETH):
+
+| Contract | Address |
+|---|---|
+| BasketRegistry | `0x653B2cC8eC8E576B0C2bFc30D100A4A6f3CC004e` |
+| IndexVault (CHIPX) | `0x8d6bbB52171499bC9e01954B8F9A74697848E9a2` |
+| Rebalancer | `0xd62D1b241162609a7383c4610cc18548Ee7235C1` |
+| IndexRouter | `0xffAA57A3bAcf1C2E672c36eAf0dD778bf9267903` |
+| IndexFeeSplitter | `0x791f923648DbCFf01AD6Aa29CfD7fe1667eDBeD6` |
+
+Same addresses as the dry run; deployed bytecode = local build. VerifyDeployment 151 PASS / 0 FAIL.
+Source verified on Basescan and Sourcify (exact match). Sourcify was submitted through its v2 API
+(`forge verify-contract --verifier sourcify` tries Etherscan first and fails without a key).
+`broadcast/` and `cache/` are git-ignored and never zipped (the zip is a `git archive`).
+
 ## 3a. Verify the live deployment (free, read-only, sends nothing)
 Run this right after the deploy, and again any time you want to confirm nothing has drifted. It
 needs no key. It prints one `PASS` or `FAIL` line per check (151 checks for the launch basket)
