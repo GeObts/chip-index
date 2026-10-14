@@ -32,9 +32,10 @@ library LaunchConfig {
     uint256 internal constant MAX_CHIP_BUY_USDC = 100;
     /// Most USDC all $CHIP buys together may spend in 24h (hard limit $2,000 in the contract).
     uint256 internal constant DAILY_CHIP_BUY_USDC = 300;
-    /// First mint by the Safe: $125 of each of the 8 stocks ($1,000) for 100 index tokens ($10).
-    uint256 internal constant SEED_USD_PER_STOCK = 125;
-    uint256 internal constant SEED_TOKENS = 100;
+    /// First mint by the Safe: $12.50 of each of the 8 stocks ($100) for 10 index tokens ($10 each)
+    /// (owner decision 2026-10-14; was $1,000 for 100). In CENTS so a seed can be any dollar amount.
+    uint256 internal constant SEED_USD_CENTS_PER_STOCK = 1_250;
+    uint256 internal constant SEED_TOKENS = 10;
 
     // Fees (bps). Hard caps live in IndexVault: mint 100 (every tier) / redeem 200 / mgmt 500.
     // Mint fee is size-tiered by the NAV value of one mint (owner decision 2026-10-13):

@@ -13,7 +13,7 @@ Every launch value is in ONE place: the `LaunchConfig` block at the top of `scri
 | $CHIP buys per 24h | $300 (hard limit $2,000) | proposed 2026-10-13 |
 | Rebalance limits | 0.75% per trade; per 24h at most 15% of NAV traded and 0.10% of NAV lost | proposed 2026-10-13 |
 | Safe settings | stricter = instant (`tighten`); looser = 48h (`queueSetting` / `executeSetting`) | decided 2026-10-13 |
-| First mint | $125 × 8 stocks = $1,000 → 100 tokens ($10 each) | decided |
+| First mint | $12.50 × 8 stocks = $100 → 10 tokens ($10 each); Safe needs up to $102 USDC | decided 2026-10-14 (was $1,000) |
 | Fees | mint 1%, redeem 1%, management 3%/yr | decided |
 | Cash mint/redeem hours | 24/7. Fresh feeds: each leg within 1% of Chainlink. Stale feeds: within 10% of the last Chainlink price (≤ 7 days old), redeem needs a nonzero min-out, mint fee base 1%. `router.tighten(4, x)` narrows the band instantly; `tighten(4, 0)` turns stale-feed cash off | decided 2026-10-14 |
 | Blocklist | refuse redeem/claim for Coinbase-blocklisted accounts | decided, built |
@@ -66,9 +66,9 @@ CHIPX_REGISTRY=0x...  CHIPX_VAULT=0x...  CHIPX_REBALANCER=0x...  CHIPX_ROUTER=0x
 ```
 VAULT=<IndexVault address> base-forge script script/SafeSeed.s.sol --rpc-url $BASE_RPC_URL
 ```
-This writes `safe/seed.json`, a single Safe Transaction Builder batch: approve USDC → buy $125 of
+This writes `safe/seed.json`, a single Safe Transaction Builder batch: approve USDC → buy $12.50 of
 each stock on Aerodrome (max +2%) → reset the approval → approve the stocks to the vault →
-`vault.seed(amounts, 100 tokens, Safe)`. The Safe needs about $1,020 of USDC. Copy the JSON to
+`vault.seed(amounts, 10 tokens, Safe)`. The Safe needs at most $102 of USDC (seed + 2%). Copy the JSON to
 Downloads, review it, then load it in the Safe app. Rehearsed on the fork: $1,000.59 spent, NAV $10.00.
 
 Full rehearsal 2026-10-13 (local base-anvil fork, deploy → seed through the real 2-of-3 Safe with

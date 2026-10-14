@@ -13,12 +13,12 @@ import {ISlipstreamRouter} from "../src/interfaces/ISlipstreamRouter.sol";
  * @notice Builds the Safe's FIRST MINT as one atomic Safe batch (Transaction Builder JSON):
  *
  *           1. approve USDC to the Aerodrome router
- *           2. buy exactly $125 (at Chainlink, now) of each of the 8 stocks, max +2% each
+ *           2. buy exactly SEED_USD_CENTS_PER_STOCK ($12.50 at launch, at Chainlink, now) of each of the 8 stocks, max +2% each
  *           3. reset the USDC approval to 0
  *           4. approve each stock to the vault
- *           5. vault.seed(amounts, 100 index tokens, Safe)
+ *           5. vault.seed(amounts, SEED_TOKENS index tokens, Safe)
  *
- *         The Safe needs about $1,020 of USDC. Everything reverts together if any step fails.
+ *         The Safe needs the seed + 2% of USDC ($102 at launch). Everything reverts together if any step fails.
  *         Nothing is sent by this script: it only writes the JSON for the owner to review and sign.
  *
  *             VAULT=0x... base-forge script script/SafeSeed.s.sol --rpc-url $BASE_RPC_URL
@@ -52,7 +52,7 @@ contract SafeSeed is Script {
             '{"version":"1.0","chainId":"8453","createdAt":',
             vm.toString(block.timestamp * 1000),
             ',"meta":{"name":"Chip Index seed","description":"Buy $',
-            vm.toString(LaunchConfig.SEED_USD_PER_STOCK),
+            _dollars(LaunchConfig.SEED_USD_CENTS_PER_STOCK),
             " of each of 8 stocks and mint ",
             vm.toString(LaunchConfig.SEED_TOKENS),
             ' index tokens. Needs up to ',
@@ -66,6 +66,12 @@ contract SafeSeed is Script {
         console2.log("wrote safe/seed.json; USDC needed at most", maxUsdc);
     }
 
+    /// @dev 1250 -> "12.50"
+    function _dollars(uint256 cents) internal pure returns (string memory) {
+        uint256 c = cents % 100;
+        return string.concat(vm.toString(cents / 100), c < 10 ? ".0" : ".", vm.toString(c));
+    }
+
     /// @notice The batch, in order. Also executed call-by-call in the fork rehearsal.
     function build(IndexVault vault, uint256 deadline) public view returns (Call[] memory calls, uint256 maxUsdc) {
         BasketRegistry registry = vault.registry();
@@ -76,8 +82,8 @@ contract SafeSeed is Script {
 
         uint256 k = 1; // slot 0 = USDC approve, filled once maxUsdc is known
         for (uint256 i; i < n; ++i) {
-            amounts[i] = registry.amountForUsd(list[i], LaunchConfig.SEED_USD_PER_STOCK * 1e18);
-            uint256 maxIn = (LaunchConfig.SEED_USD_PER_STOCK * 1e6) * (10_000 + BUY_BUFFER_BPS) / 10_000;
+            amounts[i] = registry.amountForUsd(list[i], LaunchConfig.SEED_USD_CENTS_PER_STOCK * 1e16);
+            uint256 maxIn = (LaunchConfig.SEED_USD_CENTS_PER_STOCK * 1e4) * (10_000 + BUY_BUFFER_BPS) / 10_000;
             maxUsdc += maxIn;
             calls[k++] = Call(
                 Addrs.SLIP_ROUTER,
