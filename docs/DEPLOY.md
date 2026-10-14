@@ -70,6 +70,16 @@ each stock on Aerodrome (max +2%) → reset the approval → approve the stocks 
 `vault.seed(amounts, 100 tokens, Safe)`. The Safe needs about $1,020 of USDC. Copy the JSON to
 Downloads, review it, then load it in the Safe app. Rehearsed on the fork: $1,000.59 spent, NAV $10.00.
 
+Full rehearsal 2026-10-13 (local base-anvil fork, deploy → seed through the real 2-of-3 Safe with
+`execTransaction` + MultiSendCallOnly → VerifyDeployment): $1,000 seed spent $1,002.17 for 100 CHIPX
+($10.00 each); an $80 seed ($10 × 8, `SEED_TOKENS = 8`) spent $80.19 for 8 CHIPX; both 150 PASS /
+0 FAIL; Safe tx ~2.2M gas. Before the seed every public mint path reverts `NotSeeded` and `seed` is
+Safe-only, so there is no first-depositor window.
+**Before the owners sign on mainnet**, simulate the exact Safe transaction against live Base
+(`eth_simulateV1`, or the Safe app's built-in simulation): base-anvil sometimes fails the first B20
+transfer it meets in a transaction (`OpcodeNotFound`), which is a simulator artefact, not a contract
+failure.
+
 ## 5. Ongoing operations
 - A new ticker: the basket entry carries its Aerodrome pool (tick spacing), so one 48h
   `queueBasket` / `executeBasket` covers it. **Take the token address from

@@ -51,12 +51,17 @@ contract SafeSeed is Script {
         string memory json = string.concat(
             '{"version":"1.0","chainId":"8453","createdAt":',
             vm.toString(block.timestamp * 1000),
-            ',"meta":{"name":"Chip Index seed","description":"Buy $125 of each of 8 stocks and mint 100 index tokens. Needs up to ',
+            ',"meta":{"name":"Chip Index seed","description":"Buy $',
+            vm.toString(LaunchConfig.SEED_USD_PER_STOCK),
+            " of each of 8 stocks and mint ",
+            vm.toString(LaunchConfig.SEED_TOKENS),
+            ' index tokens. Needs up to ',
             vm.toString(maxUsdc / 1e6),
             ' USDC in the Safe."},"transactions":',
             txs,
             "]}"
         );
+        vm.createDir("safe", true);
         vm.writeFile("safe/seed.json", json);
         console2.log("wrote safe/seed.json; USDC needed at most", maxUsdc);
     }

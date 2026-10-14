@@ -9,7 +9,8 @@ optimizer = true
 optimizer_runs = 200
 # Per-test gas budget: the 2,000-loop round-trip test needs ~1.4B gas (default is ~1.07B).
 gas_limit = 4_000_000_000
-fs_permissions = [{ access = "read", path = "./test/fork" }]
+# SafeSeed.s.sol writes the Safe batch to ./safe/seed.json.
+fs_permissions = [{ access = "read", path = "./test/fork" }, { access = "write", path = "./safe" }]
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "base-std/=lib/base-std/src/",
