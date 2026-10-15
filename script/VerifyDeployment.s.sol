@@ -165,15 +165,15 @@ contract VerifyDeployment is Script {
         _ok(
             m.baseBps == LaunchConfig.MINT_FEE_BASE_BPS && m.tier1Bps == LaunchConfig.MINT_FEE_TIER1_BPS
                 && m.tier2Bps == LaunchConfig.MINT_FEE_TIER2_BPS,
-            "mint fee 1% / 0.75% / 0.5%"
+            "mint fee 0.5% on every tier"
         );
         _ok(
             m.tier1MinUsd == LaunchConfig.MINT_TIER1_MIN_USD * 1e18
                 && m.tier2MinUsd == LaunchConfig.MINT_TIER2_MIN_USD * 1e18,
             "mint fee tiers from $10,000 and $50,000"
         );
-        _ok(d.vault.redeemFeeBps() == LaunchConfig.REDEEM_FEE_BPS, "redeem fee 1%");
-        _ok(d.vault.mgmtFeeBps() == LaunchConfig.MGMT_FEE_BPS, "management fee 3% a year");
+        _ok(d.vault.redeemFeeBps() == LaunchConfig.REDEEM_FEE_BPS, "redeem fee 0.5%");
+        _ok(d.vault.mgmtFeeBps() == LaunchConfig.MGMT_FEE_BPS, "management fee 1% a year");
     }
 
     function _caps(Deploy.Deployed memory d) internal {

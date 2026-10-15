@@ -14,8 +14,8 @@ Every launch value is in ONE place: the `LaunchConfig` block at the top of `scri
 | Rebalance limits | 0.75% per trade; per 24h at most 15% of NAV traded and 0.10% of NAV lost | proposed 2026-10-13 |
 | Safe settings | stricter = instant (`tighten`); looser = 48h (`queueSetting` / `executeSetting`) | decided 2026-10-13 |
 | First mint | $12.50 × 8 stocks = $100 → 10 tokens ($10 each); Safe needs up to $102 USDC | decided 2026-10-14 (was $1,000) |
-| Fees | mint 1%, redeem 1%, management 3%/yr | decided |
-| Cash mint/redeem hours | 24/7. Fresh feeds: each leg within 1% of Chainlink. Stale feeds: within 10% of the last Chainlink price (≤ 7 days old), redeem needs a nonzero min-out, mint fee base 1%. `router.tighten(4, x)` narrows the band instantly; `tighten(4, 0)` turns stale-feed cash off | decided 2026-10-14 |
+| Fees | mint 0.5% every tier, redeem 0.5%, management 1%/yr (launched at mint 1% / 0.75% / 0.5%, redeem 1%, management 3%/yr) | decided 2026-10-14: redeem + management instant via `tighten`; mint schedule via the 48h `queueMintFeeSchedule` |
+| Cash mint/redeem hours | 24/7. Fresh feeds: each leg within 1% of Chainlink. Stale feeds: within 10% of the last Chainlink price (≤ 7 days old), redeem needs a nonzero min-out, mint fee = base rate. `router.tighten(4, x)` narrows the band instantly; `tighten(4, 0)` turns stale-feed cash off | decided 2026-10-14 |
 | Blocklist | refuse redeem/claim for Coinbase-blocklisted accounts | decided, built |
 | Independent review | `docs/REVIEW_PACKAGE.md` | before real money |
 

@@ -38,15 +38,19 @@ library LaunchConfig {
     uint256 internal constant SEED_TOKENS = 10;
 
     // Fees (bps). Hard caps live in IndexVault: mint 100 (every tier) / redeem 200 / mgmt 500.
-    // Mint fee is size-tiered by the NAV value of one mint (owner decision 2026-10-13):
-    // under $10,000 pays 1%, $10,000 to $49,999 pays 0.75%, $50,000 and up pays 0.5%.
+    // The values the LIVE vault should hold (VerifyDeployment checks these). Owner decision
+    // 2026-10-14, after launch: every fee lowered. Mint 0.5% on every tier (the tier thresholds
+    // stay, because the contract requires them); redeem 0.5%; management 1% a year.
+    // Launched with: mint 1% / 0.75% / 0.5%, redeem 1%, management 3% a year.
+    // Redeem and management were lowered instantly (tighten); the mint schedule goes through
+    // the 48h timelock (queueMintFeeSchedule / executeMintFeeSchedule).
     uint256 internal constant MINT_TIER1_MIN_USD = 10_000;
     uint256 internal constant MINT_TIER2_MIN_USD = 50_000;
-    uint16 internal constant MINT_FEE_BASE_BPS = 100;
-    uint16 internal constant MINT_FEE_TIER1_BPS = 75;
+    uint16 internal constant MINT_FEE_BASE_BPS = 50;
+    uint16 internal constant MINT_FEE_TIER1_BPS = 50;
     uint16 internal constant MINT_FEE_TIER2_BPS = 50;
-    uint16 internal constant REDEEM_FEE_BPS = 100;
-    uint16 internal constant MGMT_FEE_BPS = 300;
+    uint16 internal constant REDEEM_FEE_BPS = 50;
+    uint16 internal constant MGMT_FEE_BPS = 100;
 }
 
 /// @notice Every Base mainnet address the deploy uses, in one place.
